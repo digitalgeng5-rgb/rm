@@ -1,0 +1,27 @@
+id: passport-onboard
+title: Passport / ANAMNESIS onboard
+phase: passport
+status: active
+version: "1.0.0"
+summary: "Live or greenfield onboard → ANAMNESIS passport via Collector+Validator path."
+depends_on: [core-harness]
+soft_depends_on: [services-data, site-scan]
+provides: [passport.anamnesis, passport.brief]
+requires_provides: []
+skills: [drmax-brandcore, seo-drmax-orchestrator]
+originals:
+  - "drmax-brandcore/ORIGINAL.md"
+  - "drmax-brandcore/NAVIGATOR.md"
+cli: [seo-onboard]
+artifacts:
+  writes:
+    - ".agents/seo/<slug>/ANAMNESIS.md"
+    - ".agents/seo/<slug>/passport/**"
+  reads:
+    - ".agents/seo/<slug>/scans/**"
+env: []
+agent_triggers: ["онбординг", "паспорт проекта", "анамнез", "новый проект seo"]
+entrypoints:
+  agent: "seo-onboard live|greenfield; then BrandCore if claims matter"
+  cli: "seo-onboard live --slug <s> --url https://…"
+scenarios: [live-site.yaml, greenfield.yaml, validate-passport.yaml]

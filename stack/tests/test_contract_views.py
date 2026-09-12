@@ -1,0 +1,562 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
+
+
+class ContractViewTests(unittest.TestCase):
+    def test_heartbeat_does_not_append_to_status(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run_dir = repo / ".agents" / "runs" / "demo"
+            run_dir.mkdir(parents=True)
+            status = run_dir / "STATUS.md"
+            status.write_text("generated sentinel\n", encoding="utf-8")
+
+            result = run(
+                str(ROOT / "bin" / "lane-heartbeat"),
+                "--repo", str(repo), "--run", "demo", "--task", "001",
+                "--status", "running", "--note", "active",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(status.read_text(encoding="utf-8"), "generated sentinel\n")
+            heartbeat = json.loads((run_dir / "artifacts" / "001" / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["note"], "active")
+
+    def test_heartbeat_rejects_path_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            (repo / ".agents" / "runs").mkdir(parents=True)
+
+            result = run(
+                str(ROOT / "bin" / "lane-heartbeat"),
+                "--repo",
+                str(repo),
+                "--run",
+                "../escape",
+                "--task",
+                "001",
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse((repo / ".agents" / "escape").exists())
+
+    def test_run_board_uses_v2_state_and_acceptance_and_rebuilds_status(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run_dir = repo / ".agents" / "runs" / "demo"
+            task_dir = run_dir / "tasks"
+            artifact = run_dir / "artifacts" / "001"
+            task_dir.mkdir(parents=True)
+            artifact.mkdir(parents=True)
+            (run_dir / "run.yaml").write_text("schema_version: 2\nslug: demo\n", encoding="utf-8")
+            task_path = task_dir / "001.yaml"
+            task_path.write_text(
+                "schema_version: 2\nid: '001'\ntitle: Demo task\nstatus: done\nlane: grok\n",
+                encoding="utf-8",
+            )
+            (artifact / "state.json").write_text(
+                json.dumps({"schema_version": 2, "task_id": "001", "status": "awaiting_verification", "attempt": 1}),
+                encoding="utf-8",
+            )
+
+            result = run(str(ROOT / "bin" / "run-board"), str(repo))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            board = (repo / ".agents" / "runs" / "BOARD.md").read_text(encoding="utf-8")
+            self.assertIn("**running**", board)
+            status = (run_dir / "STATUS.md").read_text(encoding="utf-8")
+            self.assertIn("state.json and acceptance.json", status)
+            self.assertNotIn("Heartbeats", status)
+
+            (artifact / "acceptance.json").write_text(
+                json.dumps({
+                    "schema_version": 2,
+                    "task_id": "001",
+                    "task_sha256": hashlib.sha256(task_path.read_bytes()).hexdigest(),
+                    "attempt": 1,
+                    "provider_exit": 0,
+                    "report": "complete",
+                    "report_sha256": "a" * 64,
+                    "owns_check": "passed",
+                    "verification": "passed",
+                    "review": "not_required",
+                    "accepted": True,
+                    "accepted_at": "2026-07-18T00:00:00Z",
+                }),
+                encoding="utf-8",
+            )
+            run(str(ROOT / "bin" / "run-board"), str(repo))
+            board = (repo / ".agents" / "runs" / "BOARD.md").read_text(encoding="utf-8")
+            self.assertIn("**done**", board)
+
+            (artifact / "state.json").write_text(
+                json.dumps({"schema_version": 2, "task_id": "001", "status": "running", "attempt": 2}),
+                encoding="utf-8",
+            )
+            run(str(ROOT / "bin" / "run-board"), str(repo))
+            board = (repo / ".agents" / "runs" / "BOARD.md").read_text(encoding="utf-8")
+            self.assertNotIn("**done**", board)
+
+            (artifact / "acceptance.json").unlink()
+            run(str(ROOT / "bin" / "run-board"), str(repo))
+            board = (repo / ".agents" / "runs" / "BOARD.md").read_text(encoding="utf-8")
+            self.assertNotIn("**done**", board)
+
+    def test_stall_mark_updates_state_without_mutating_v2_task(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run_dir = repo / ".agents" / "runs" / "demo"
+            task_dir = run_dir / "tasks"
+            artifact = run_dir / "artifacts" / "001"
+            task_dir.mkdir(parents=True)
+            artifact.mkdir(parents=True)
+            task_text = "schema_version: 2\nid: '001'\ntitle: Demo\n"
+            task_path = task_dir / "001.yaml"
+            task_path.write_text(task_text, encoding="utf-8")
+            (artifact / "state.json").write_text(
+                json.dumps({"schema_version": 2, "task_id": "001", "status": "running", "attempt": 1}),
+                encoding="utf-8",
+            )
+
+            result = run(str(ROOT / "bin" / "lane-stall-check"), str(repo), "--minutes", "0", "--mark")
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(task_path.read_text(encoding="utf-8"), task_text)
+            state = json.loads((artifact / "state.json").read_text())
+            self.assertEqual(state["status"], "stalled")
+
+    def test_owns_check_writes_machine_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run("git", "init", "-b", "main", cwd=repo)
+            run("git", "config", "user.email", "test@example.com", cwd=repo)
+            run("git", "config", "user.name", "Test", cwd=repo)
+            owned = repo / "src" / "owned.txt"
+            owned.parent.mkdir(parents=True)
+            owned.write_text("base\n", encoding="utf-8")
+            run("git", "add", "src/owned.txt", cwd=repo)
+            run("git", "commit", "-m", "base", cwd=repo)
+            owned.write_text("changed\n", encoding="utf-8")
+            task_dir = repo / ".agents" / "runs" / "demo" / "tasks"
+            task_dir.mkdir(parents=True)
+            task = task_dir / "001.yaml"
+            task.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\nowns_paths:\n  - src/owned.txt\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+
+            result = run(str(ROOT / "bin" / "check-owns-paths"), str(task), "--cwd", str(repo))
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            receipt = json.loads((repo / ".agents" / "runs" / "demo" / "artifacts" / "001" / "owns-check.json").read_text())
+            self.assertEqual(receipt["status"], "passed")
+            self.assertEqual(receipt["changed_files"], ["src/owned.txt"])
+            self.assertEqual(len(receipt["task_sha256"]), 64)
+
+    def test_owns_check_fails_closed_when_git_inspection_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            task_dir = repo / ".agents" / "runs" / "demo" / "tasks"
+            task_dir.mkdir(parents=True)
+            task = task_dir / "001.yaml"
+            task.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\nowns_paths:\n  - src/**\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+
+            result = run(str(ROOT / "bin" / "check-owns-paths"), str(task), "--cwd", str(repo))
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("git", result.stderr.lower())
+            receipt = json.loads(
+                (repo / ".agents" / "runs" / "demo" / "artifacts" / "001" / "owns-check.json").read_text()
+            )
+            self.assertEqual(receipt["status"], "failed")
+            self.assertIn("error", receipt)
+
+    def test_owns_check_run_scope_accepts_disjoint_parallel_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run("git", "init", "-b", "main", cwd=repo)
+            run("git", "config", "user.email", "test@example.com", cwd=repo)
+            run("git", "config", "user.name", "Test", cwd=repo)
+            (repo / "a.txt").write_text("base a\n", encoding="utf-8")
+            (repo / "b.txt").write_text("base b\n", encoding="utf-8")
+            run("git", "add", "a.txt", "b.txt", cwd=repo)
+            run("git", "commit", "-m", "base", cwd=repo)
+            (repo / "a.txt").write_text("task a\n", encoding="utf-8")
+            (repo / "b.txt").write_text("task b\n", encoding="utf-8")
+            task_dir = repo / ".agents" / "runs" / "demo" / "tasks"
+            task_dir.mkdir(parents=True)
+            task_a = task_dir / "001.yaml"
+            task_b = task_dir / "002.yaml"
+            task_a.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\nowns_paths: ['a.txt']\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+            task_b.write_text(
+                f"schema_version: 2\nid: '002'\nproject_cwd: '{repo}'\nowns_paths: ['b.txt']\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+
+            individual = run(
+                str(ROOT / "bin" / "check-owns-paths"),
+                str(task_a),
+                "--cwd",
+                str(repo),
+            )
+            shared = run(
+                str(ROOT / "bin" / "check-owns-paths"),
+                str(task_a),
+                "--cwd",
+                str(repo),
+                "--run-scope",
+            )
+
+            # Without a dirt baseline, sibling dirt outside owns is foreign-ignored
+            # (parallel-session / parallel-task safety). Run-scope still accepts the union.
+            self.assertEqual(individual.returncode, 0, individual.stdout + individual.stderr)
+            self.assertIn("foreign dirt ignored", individual.stdout)
+            self.assertEqual(shared.returncode, 0, shared.stdout + shared.stderr)
+            receipt = json.loads(
+                (
+                    repo
+                    / ".agents"
+                    / "runs"
+                    / "demo"
+                    / "artifacts"
+                    / "001"
+                    / "owns-check.json"
+                ).read_text()
+            )
+            self.assertEqual(receipt["scope"], "run")
+            self.assertEqual(receipt["scope_task_ids"], ["001", "002"])
+            self.assertEqual(receipt["changed_files"], ["a.txt", "b.txt"])
+
+    def test_owns_check_ignores_living_memory_files(self) -> None:
+        # A concurrent session-ledger flush rewrites root PROGRESS.md/LESSONS.md
+        # in the same worktree; the gate must not treat that as a writer stray.
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run("git", "init", "-b", "main", cwd=repo)
+            run("git", "config", "user.email", "test@example.com", cwd=repo)
+            run("git", "config", "user.name", "Test", cwd=repo)
+            owned = repo / "src" / "owned.txt"
+            owned.parent.mkdir(parents=True)
+            owned.write_text("base\n", encoding="utf-8")
+            (repo / "PROGRESS.md").write_text("base progress\n", encoding="utf-8")
+            (repo / "LESSONS.md").write_text("base lessons\n", encoding="utf-8")
+            (repo / "AGENTS.md").write_text("base agents\n", encoding="utf-8")
+            (repo / "CLAUDE.md").write_text("base claude\n", encoding="utf-8")
+            run(
+                "git",
+                "add",
+                "src/owned.txt",
+                "PROGRESS.md",
+                "LESSONS.md",
+                "AGENTS.md",
+                "CLAUDE.md",
+                cwd=repo,
+            )
+            run("git", "commit", "-m", "base", cwd=repo)
+            owned.write_text("changed\n", encoding="utf-8")
+            (repo / "PROGRESS.md").write_text("session ledger flush\n", encoding="utf-8")
+            (repo / "LESSONS.md").write_text("night audit touch\n", encoding="utf-8")
+            (repo / "AGENTS.md").write_text("<!-- gitnexus:start -->\n", encoding="utf-8")
+            (repo / "CLAUDE.md").write_text("<!-- gitnexus:start -->\n", encoding="utf-8")
+            task_dir = repo / ".agents" / "runs" / "demo" / "tasks"
+            task_dir.mkdir(parents=True)
+            task = task_dir / "001.yaml"
+            task.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\nowns_paths:\n  - src/owned.txt\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+
+            result = run(str(ROOT / "bin" / "check-owns-paths"), str(task), "--cwd", str(repo))
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            receipt = json.loads(
+                (repo / ".agents" / "runs" / "demo" / "artifacts" / "001" / "owns-check.json").read_text()
+            )
+            self.assertEqual(receipt["status"], "passed")
+            self.assertEqual(receipt["changed_files"], ["src/owned.txt"])
+            self.assertEqual(receipt["violations"], [])
+
+
+    def test_owns_check_ignores_foreign_dirt_without_baseline(self) -> None:
+        """Uncommitted files outside owns_paths that the writer did not claim do not fail."""
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run("git", "init", "-b", "main", cwd=repo)
+            run("git", "config", "user.email", "test@example.com", cwd=repo)
+            run("git", "config", "user.name", "Test", cwd=repo)
+            owned = repo / "src" / "owned.txt"
+            owned.parent.mkdir(parents=True)
+            owned.write_text("base\n", encoding="utf-8")
+            foreign = repo / "apps" / "other" / "foreign.txt"
+            foreign.parent.mkdir(parents=True)
+            foreign.write_text("base foreign\n", encoding="utf-8")
+            run("git", "add", "src/owned.txt", "apps/other/foreign.txt", cwd=repo)
+            run("git", "commit", "-m", "base", cwd=repo)
+            owned.write_text("writer change\n", encoding="utf-8")
+            foreign.write_text("parallel session dirt\n", encoding="utf-8")
+            task_dir = repo / ".agents" / "runs" / "demo" / "tasks"
+            task_dir.mkdir(parents=True)
+            task = task_dir / "001.yaml"
+            task.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\nowns_paths:\n  - src/**\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+
+            result = run(str(ROOT / "bin" / "check-owns-paths"), str(task), "--cwd", str(repo))
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            receipt = json.loads(
+                (repo / ".agents" / "runs" / "demo" / "artifacts" / "001" / "owns-check.json").read_text()
+            )
+            self.assertEqual(receipt["status"], "passed")
+            self.assertEqual(receipt["violations"], [])
+            self.assertIn("apps/other/foreign.txt", receipt["foreign_ignored"])
+            self.assertIn("src/owned.txt", receipt["evaluated_files"])
+
+    def test_owns_check_fails_new_outside_owns_with_baseline(self) -> None:
+        """With dirt baseline, newly introduced outside-owns paths still fail (writer leak)."""
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run("git", "init", "-b", "main", cwd=repo)
+            run("git", "config", "user.email", "test@example.com", cwd=repo)
+            run("git", "config", "user.name", "Test", cwd=repo)
+            owned = repo / "src" / "owned.txt"
+            owned.parent.mkdir(parents=True)
+            owned.write_text("base\n", encoding="utf-8")
+            foreign = repo / "apps" / "other" / "foreign.txt"
+            foreign.parent.mkdir(parents=True)
+            foreign.write_text("base foreign\n", encoding="utf-8")
+            run("git", "add", "src/owned.txt", "apps/other/foreign.txt", cwd=repo)
+            run("git", "commit", "-m", "base", cwd=repo)
+            # Pre-existing parallel dirt
+            foreign.write_text("already dirty\n", encoding="utf-8")
+            task_dir = repo / ".agents" / "runs" / "demo" / "tasks"
+            task_dir.mkdir(parents=True)
+            task = task_dir / "001.yaml"
+            task.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\nowns_paths:\n  - src/**\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+            artifact = repo / ".agents" / "runs" / "demo" / "artifacts" / "001"
+            artifact.mkdir(parents=True)
+            baseline = artifact / "dirt-baseline.json"
+            write = run(
+                str(ROOT / "bin" / "check-owns-paths"),
+                "--write-dirt-baseline",
+                str(baseline),
+                "--cwd",
+                str(repo),
+            )
+            self.assertEqual(write.returncode, 0, write.stdout + write.stderr)
+            # Writer edits owned + leaks a new file outside owns
+            owned.write_text("writer\n", encoding="utf-8")
+            leak = repo / "apps" / "other" / "leak.txt"
+            leak.write_text("writer leak\n", encoding="utf-8")
+
+            result = run(str(ROOT / "bin" / "check-owns-paths"), str(task), "--cwd", str(repo))
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            receipt = json.loads((artifact / "owns-check.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertIn("apps/other/leak.txt", receipt["violations"])
+            self.assertIn("apps/other/foreign.txt", receipt["foreign_ignored"])
+            self.assertNotIn("apps/other/foreign.txt", receipt["violations"])
+
+    def test_owns_check_ignores_sibling_run_dirt_with_baseline(self) -> None:
+        """New dirt that another live/unmerged run owns is foreign, not a leak."""
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run("git", "init", "-b", "main", cwd=repo)
+            run("git", "config", "user.email", "test@example.com", cwd=repo)
+            run("git", "config", "user.name", "Test", cwd=repo)
+            owned = repo / "apps" / "admin" / "nav.ts"
+            owned.parent.mkdir(parents=True)
+            owned.write_text("base\n", encoding="utf-8")
+            hero = repo / "apps" / "marketing" / "HeroIntro.vue"
+            hero.parent.mkdir(parents=True)
+            hero.write_text("base hero\n", encoding="utf-8")
+            run("git", "add", "apps/admin/nav.ts", "apps/marketing/HeroIntro.vue", cwd=repo)
+            run("git", "commit", "-m", "base", cwd=repo)
+
+            this_tasks = repo / ".agents" / "runs" / "admin-nav" / "tasks"
+            this_tasks.mkdir(parents=True)
+            task = this_tasks / "001.yaml"
+            task.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\n"
+                "owns_paths:\n  - apps/admin/**\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+            artifact = repo / ".agents" / "runs" / "admin-nav" / "artifacts" / "001"
+            artifact.mkdir(parents=True)
+            baseline = artifact / "dirt-baseline.json"
+            write = run(
+                str(ROOT / "bin" / "check-owns-paths"),
+                "--write-dirt-baseline",
+                str(baseline),
+                "--cwd",
+                str(repo),
+            )
+            self.assertEqual(write.returncode, 0, write.stdout + write.stderr)
+
+            sibling_tasks = repo / ".agents" / "runs" / "hero-block" / "tasks"
+            sibling_tasks.mkdir(parents=True)
+            (sibling_tasks / "001.yaml").write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\n"
+                "owns_paths:\n  - apps/marketing/**\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+            sibling_art = repo / ".agents" / "runs" / "hero-block" / "artifacts" / "001"
+            sibling_art.mkdir(parents=True)
+            (repo / ".agents" / "runs" / "hero-block" / "controller.json").write_text(
+                json.dumps(
+                    {
+                        "project_cwd": str(repo),
+                        "stage": "accepted",
+                        "tasks": {"001": {"stage": "accepted"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (sibling_art / "outcome.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "001",
+                        "files_changed": ["apps/marketing/HeroIntro.vue"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            owned.write_text("admin writer\n", encoding="utf-8")
+            hero.write_text("sibling writer\n", encoding="utf-8")
+            leak = repo / "apps" / "other" / "leak.txt"
+            leak.parent.mkdir(parents=True)
+            leak.write_text("real leak\n", encoding="utf-8")
+
+            result = run(str(ROOT / "bin" / "check-owns-paths"), str(task), "--cwd", str(repo))
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            receipt = json.loads((artifact / "owns-check.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertIn("apps/marketing/HeroIntro.vue", receipt["foreign_ignored"])
+            self.assertNotIn("apps/marketing/HeroIntro.vue", receipt["violations"])
+            self.assertIn("apps/other/leak.txt", receipt["violations"])
+
+    def test_owns_check_ignores_live_sibling_owns_with_baseline(self) -> None:
+        """A still-running sibling run's owns_paths explain dirt that appeared after baseline."""
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run("git", "init", "-b", "main", cwd=repo)
+            run("git", "config", "user.email", "test@example.com", cwd=repo)
+            run("git", "config", "user.name", "Test", cwd=repo)
+            owned = repo / "apps" / "admin" / "nav.ts"
+            owned.parent.mkdir(parents=True)
+            owned.write_text("base\n", encoding="utf-8")
+            run("git", "add", "apps/admin/nav.ts", cwd=repo)
+            run("git", "commit", "-m", "base", cwd=repo)
+
+            this_tasks = repo / ".agents" / "runs" / "admin-nav" / "tasks"
+            this_tasks.mkdir(parents=True)
+            task = this_tasks / "001.yaml"
+            task.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\n"
+                "owns_paths:\n  - apps/admin/**\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+            artifact = repo / ".agents" / "runs" / "admin-nav" / "artifacts" / "001"
+            artifact.mkdir(parents=True)
+            write = run(
+                str(ROOT / "bin" / "check-owns-paths"),
+                "--write-dirt-baseline",
+                str(artifact / "dirt-baseline.json"),
+                "--cwd",
+                str(repo),
+            )
+            self.assertEqual(write.returncode, 0, write.stdout + write.stderr)
+
+            sibling_tasks = repo / ".agents" / "runs" / "hero-block" / "tasks"
+            sibling_tasks.mkdir(parents=True)
+            (sibling_tasks / "001.yaml").write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\n"
+                "owns_paths:\n  - apps/marketing/**\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+            (repo / ".agents" / "runs" / "hero-block" / "controller.json").write_text(
+                json.dumps({"project_cwd": str(repo), "stage": "running", "tasks": {}}),
+                encoding="utf-8",
+            )
+
+            owned.write_text("admin writer\n", encoding="utf-8")
+            hero = repo / "apps" / "marketing" / "HeroIntro.vue"
+            hero.parent.mkdir(parents=True)
+            hero.write_text("sibling still writing\n", encoding="utf-8")
+
+            result = run(str(ROOT / "bin" / "check-owns-paths"), str(task), "--cwd", str(repo))
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            receipt = json.loads((artifact / "owns-check.json").read_text())
+            self.assertEqual(receipt["status"], "passed")
+            self.assertIn("apps/marketing/HeroIntro.vue", receipt["foreign_ignored"])
+            self.assertEqual(receipt["violations"], [])
+
+    def test_owns_check_ignores_npm_cache_dirt(self) -> None:
+        """npm cache filled during typecheck/install must not owns-fail the lane."""
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            run("git", "init", "-b", "main", cwd=repo)
+            run("git", "config", "user.email", "test@example.com", cwd=repo)
+            run("git", "config", "user.name", "Test", cwd=repo)
+            owned = repo / "src" / "owned.txt"
+            owned.parent.mkdir(parents=True)
+            owned.write_text("base\n", encoding="utf-8")
+            run("git", "add", "src/owned.txt", cwd=repo)
+            run("git", "commit", "-m", "base", cwd=repo)
+            owned.write_text("writer\n", encoding="utf-8")
+            cache = repo / ".npm-cache" / "_cacache" / "content-v2" / "sha512" / "ab" / "cd"
+            cache.mkdir(parents=True)
+            (cache / "blob").write_bytes(b"x" * 32)
+            # also bare npm-cache/ (some envs)
+            bare = repo / "npm-cache" / "_cacache" / "x"
+            bare.mkdir(parents=True)
+            (bare / "y").write_text("y\n", encoding="utf-8")
+            task_dir = repo / ".agents" / "runs" / "demo" / "tasks"
+            task_dir.mkdir(parents=True)
+            task = task_dir / "001.yaml"
+            task.write_text(
+                f"schema_version: 2\nid: '001'\nproject_cwd: '{repo}'\nowns_paths:\n  - src/**\nnever_touch: []\n",
+                encoding="utf-8",
+            )
+
+            result = run(str(ROOT / "bin" / "check-owns-paths"), str(task), "--cwd", str(repo))
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            receipt = json.loads(
+                (repo / ".agents" / "runs" / "demo" / "artifacts" / "001" / "owns-check.json").read_text()
+            )
+            self.assertEqual(receipt["status"], "passed")
+            self.assertEqual(receipt["violations"], [])
+            changed = receipt["changed_files"]
+            self.assertTrue(any(c.endswith("owned.txt") or c == "src/owned.txt" for c in changed))
+            self.assertFalse(any("npm-cache" in c or ".npm-cache" in c for c in changed))
+
+
+if __name__ == "__main__":
+    unittest.main()

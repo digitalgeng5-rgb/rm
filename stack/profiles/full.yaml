@@ -1,0 +1,8 @@
+# Claude + Kimi write (Qwen/Grok/AGY selectable) + Codex review
+pm: claude
+profile: full
+lanes:
+  fast_write: kimi         # run-supervisor passes --provider kimi
+  main_write: kimi         # use --provider qwen|grok|agy to switch
+  review: codex            # → night-reviewer agent
+  emergency_write: codex   # → emergency-writer agent

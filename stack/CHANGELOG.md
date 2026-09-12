@@ -1,0 +1,991 @@
+## 1.27.0 — 2026-09-11
+
+### Changed
+- **Current DrMax pack.** Live skills: Cocoon Engine X4, BrandCore,
+  Humanization, ai-detect 3.9.4, SignalForge, Latent Intent,
+  Market-Scoped, PromptSculptor. `seo-specialist` and
+  `seo-drmax-orchestrator` route to these only.
+
+### Removed
+- Book/corpus skills: `seo-prompt-engineering-2026`,
+  `seo-evidence-based-2026`, `seo-copywriting`, `drmax-cvd`,
+  `drmax-lexadapt`. `install.sh` treats them as stale host copies.
+
+## 1.26.0 — 2026-09-11
+
+### Added
+- **`web-design`** router: web-designer role, layout rules, routes
+  taste / impeccable / DESIGN.md / prototype. Audit is `design-lead`
+  `MODE=audit`; live Vue stays a writer run.
+- **`design-taste`**: lane adapter of
+  [Leonxlnx/taste-skill](https://github.com/Leonxlnx/taste-skill) (MIT).
+  Design read, dials, anti-slop tells. No React/Tailwind defaults.
+- **`impeccable-ui`**: lane adapter of
+  [pbakaus/impeccable](https://github.com/pbakaus/impeccable) (Apache-2.0).
+  Command map + craft-floor. No `PRODUCT.md`, no hooks, no
+  `npx impeccable install`.
+
+## 1.25.0 — 2026-09-09
+
+### Added
+- **`/bulk-reader` + `pm_read` CLI** (Spotify shunt-style). Fat files
+  (`pm_read.enabled`, default >350 lines) are mapped by the project's
+  cheap worker. The PreToolUse hook blocks full `Read` and shell dumps
+  (`cat` / `head` / `tail` / `sed`); Claude runs `pm_read --path FILE`
+  and keeps `PM_READ_BRIEF` only.
+
+## 1.24.0 — 2026-09-01
+
+### Added
+- **`ru-text` / `ru-check` / `ru-score`** from
+  [talkstream/ru-text](https://github.com/talkstream/ru-text) (MIT).
+  Call on Russian text quality: proofread, typography, neuroslop, edit,
+  UX copy, business mail, or the name `ru-text`. Wired to `copy-lead` and
+  `seo-specialist`. Check/score never write files.
+
+## 1.23.0 — 2026-09-01
+
+### Added
+- **`page-prototype` kit + publish:** `references/kit/proto.css` / `proto.js`,
+  `publish.py` (`--one` / `--bundle` / `--new`). Same page folder reuses the
+  24h URL via `.host.json` + `POST /api/pages` `id`. New folder → new URL.
+- **html-host** (`apps/html-host`): 24h preview at html.vechkasov.pro.
+  Dark HTML/CSS/JS editor, CodeMirror, live preview without flicker,
+  update-in-place API.
+
+## 1.22.0 — 2026-09-01
+
+### Added
+- **`page-prototype`:** gray Axure-like HTML wireframes. Skill only.
+  Tree: `site/<slug>/`, `app/<app>/<slug>/`, `flows/<flow>/` under
+  `.agents/prototypes/`. On `copy-lead`, `seo-specialist`,
+  `dev-orchestrator`. Not Vue, not DESIGN.md.
+- **SEO API skills in the plugin:** `mutagen`, `xmlstock`, `proxy6`,
+  `yandex-webmaster`, `yandex-metrica`, `google-search-console`,
+  `ga4-data-api`, `google-cloud-auth`. Methodology was already shipped;
+  these are the paid-API playbooks `seo-specialist` lists. Keys stay in
+  `~/secrets/*.env`. Host `seo-*` CLI is still not in the plugin.
+- **`tavily` + `copy-research`:** cited web search and copy-lead helper
+  recipes. Optional output style `copywriter` (session-only).
+
+## 1.21.0 — 2026-08-31
+
+### Added
+- **Site copy pack** (not SEO): `copy-project-life` + `site-copy-audience` /
+  `headlines` / `ux`. Disk SoT `.agents/copy/` from skill templates
+  (anamnesis, audience, buyer persona, voice, page brief). First full
+  analysis runs `first-interview.md` in 2–3-question batches. Catalog:
+  `/lane-stack:info` item 8.
+
+### Changed
+- **Slash `/lane-stack:resume-project` runs the CLI**, not the cheat sheet.
+  Skills that share a command name are `user-invocable: false`.
+- **lane-memory CORE restamp:** `agents-doctor --apply`, `lane-memory write`,
+  and onboard (including Luna rewrite / failed VALIDATION) inject
+  `<!-- lane-memory:core -->` again.
+- **Onboard VALIDATION** stays `set -euo pipefail`; FLOWS is SoT; refuse
+  `complete` on stubs.
+
+## 1.20.0 — 2026-08-29
+
+### Changed
+- **`seo-specialist` is a first-class plugin agent** with the DrMax skills it
+  actually runs (`seo-drmax-orchestrator`, prompt corpus, evidence-based,
+  copy, ai-detect, CVD / latent-intent / humanization / LexAdapt). Host
+  `seo-*` CLI + seodoc stay in seo-orchestration. `cc` / `lane-pm` no longer
+  re-send `initialPrompt` (Claude Code 2.1+ already does).
+- **`seo-system` + `seo-project-life`.** Module catalog installs to
+  `~/.agents/seo-system` (`seo-module list`). Skill maps `.agents/seo/` vs
+  the host catalog — not a second methodology.
+
+## 1.19.0 — 2026-08-29
+
+### Changed
+- **Install registers the GitHub marketplace with `autoUpdate: true`.**
+  Live checkout: `LANE_INSTALL_LOCAL_MARKETPLACE=1`. Host `~/.agents` still
+  needs `./install.sh`.
+- **`pm_stop_sentinel` no longer blocks Stop while `rs-*` is live.** Ctrl+C
+  / session exit is allowed; wake stays on PostToolUse.
+- **`lane-pm` injects the real session `--name`.** Boot prompt no longer
+  ships a copyable example (`blyt-…`); the PM must not invent a name.
+
+## 1.18.0 — 2026-08-28
+
+### Changed
+- **adoc re-execs from the source repo** and merges missing stages (Memory/Docs)
+  without resetting `memory.enabled`.
+- **Trusted `STATUS: partial`** is a contract block (`provider_partial`), not a
+  writer retry. `owns_paths` starting with `.agents` is rejected (`run-validate`).
+- **`check-owns-paths` ignores sibling-run dirt** on a shared in_place tree
+  (live runs + accepted leftover `files_changed`). Real leaks still fail-closed.
+- **`pm_stop_sentinel` ignores parked `rs-*` chips** (`idle`/`completed`).
+  Only an in-flight supervisor still blocks Stop.
+
+## 1.17.0 — 2026-08-26
+
+### Changed
+- **OpenCode as conveyor writer and plan critic.** `adoc` Coder/Stages can
+  pick host OpenCode models (`opencode models`) and harness agents
+  (`lane-writer` / `lane-critic` / `lane-reviewer`; builtins `build` /
+  `plan` still listed). Writer: `opencode run
+  --pure --format json --agent … --dangerously-skip-permissions`.
+  Nested `task` denied. Resume via `--session`. Not a PM replacement.
+  Effort picker reads live `variants` per model (`opencode models
+  --verbose`). No variants → field hidden, `--variant` omitted.
+- **One skill `project-life` replaces `agent-todos` + `project-memory`.**
+  Lifecycle: idea → todo → `.agents/plans/` map → run → PROGRESS/LESSONS.
+  Cold start stays `resume-project`. `./install.sh` does not delete
+  `~/.claude/skills/project-life` (user copy is kept).
+- **`lane-pm` launcher:** `claude --agent` often skips `initialPrompt`;
+  `~/.agents/bin/lane-pm` submits the boot prompt and names the session
+  `<agent>-<folder>-DD-MM-YYYY`.
+- **PM must not wait after `rs-*` finished.** Host «Teammate finished» is
+  not a digest. Same turn: read `controller.json`; re-dispatch supervisor
+  or recover a block — do not wait to be poked.
+- **Session `--name` is unique per launch:** `<4chars>-<folder>-DD-MM-YYYY`
+  (e.g. `blyt-selfystudio-26-08-2026`) so two PMs on the same project
+  do not share a SendMessage target.
+- **`run-supervisor` SendMessage** targets that unique `--name`, never bare
+  `dev-orchestrator` (that leaked feed-gen progress into selfystudio).
+- **PM Stop sentinel.** `pm_stop_sentinel.py`: first Stop while
+  `run-supervisor` is in `background_tasks` is blocked; `PostToolUse`
+  `Agent|Task` `asyncRewake` polls `controller.json` and wakes idle PM
+  on `accepted|blocked|failed`. Disable: `LANE_PM_STOP_SENTINEL=0`.
+- **Plan critic is a coverage auditor.** Structural: empty/overlap owns,
+  missing verify, `rg` + GitNexus callers, sibling tests. LLM (if any)
+  only compresses that list — cannot add findings or change the decision.
+- **`check-owns-paths` ignores root `AGENTS.md` / `CLAUDE.md`**
+  (GitNexus `<!-- gitnexus:start -->` inject on analyze).
+- **adoc Stages: Fast mode on plan critique** when provider is Codex/Cursor
+  (`stages.plan_critique.service_tier`). Codex exec gets `service_tier=fast`.
+- **adoc Info tab** (`?`): roles, conveyor, first-hour commands for an
+  existing repo, and where to pick the onboard model (Stages → Onboard).
+- **Plan critique is a coverage helper** for large/hard runs only
+  (`score≥7`, ≥3 write tasks, or high-risk). It flags files that import
+  planned paths but are missing from `owns_paths`. Small UI tweaks skip.
+
+## 1.16.0 — 2026-08-25
+
+### Changed
+- **Claude-facing stack is a plugin marketplace.** Catalog:
+  `.claude-plugin/marketplace.json`. Plugin: `plugins/lane-stack/`
+  (`plugin.json`, agents, commands, skills). `./install.sh` symlinks the
+  checkout to `~/.claude/plugins/marketplaces/claude-lane-stack`, writes
+  `extraKnownMarketplaces` + `enabledPlugins["lane-stack@claude-lane-stack"]`,
+  and runs `claude plugin install lane-stack@claude-lane-stack`. Stack
+  agents/skills are **not** copied into `~/.claude/agents` or
+  `~/.claude/skills` (user copies override plugins; Codex also scans the
+  Claude skill catalog). Host runtime (`bin/`, board, writer profiles) still
+  rsyncs to `~/.agents`. PM playbooks stay out of the shared writer catalog.
+  Re-running install **deletes** leftover `~/.claude/skills/<stack-skill>`
+  directories (plugin is the Claude source of truth).
+
+## 1.15.1 — 2026-08-24
+
+### Changed
+- **PM playbook is Claude-only.** `orchestrator-lanes` (and deprecated
+  `orchestrator-workflow`) install to `~/.agents/pm-skills/` only — not
+  `~/.agents/skills/` and **not** `~/.claude/skills/` (Codex also scans the
+  Claude catalog and was `wt-create`-ing despite adoc `in_place`).
+  `dev-orchestrator` Reads the pm-skills path on WRITE runs. `install.sh`
+  disables the names in `~/.grok/config.toml` when the file exists.
+- **Dropped CLI encyclopedia skills** `claude-code` and `codex` from the
+  stack `skills/` tree (lane docs/profiles already cover writers). Host
+  catalog copies archived; `~/tools/skill-updater` and its 05:30 cron
+  removed (was rewriting those SKILL.md from GitHub changelogs via Codex).
+
+## 1.15.0 — 2026-08-13
+
+### Added
+- **adoc Work: tasks per writer session (1–10).** Saved as
+  `workspace.session_max_tasks`. `1` = new session every task. Keys `[` `]` or
+  `,` `.`. CLI: `agents-doctor --apply --session-max-tasks N`.
+- **Codex warm resume** (no longer ephemeral). Isolated per-slot `CODEX_HOME`.
+  All writers persist `session_id` and resume until the task limit.
+- **LLM-first onboard pack:** `MODULE_MAP` / `API_SURFACE` / `DESIGN.md` /
+  `RUNBOOK` / app-pack templates + onboard fill TUI.
+- **Living memory** hook and **teammate idle sentinel**.
+
+### Changed
+- Default warm rotation is **10** successful tasks (was 7); Codex included.
+- `lane-ctl start` / `run-controller` read `session_max_tasks` from the adoc
+  profile when `--max-tasks` is omitted.
+
+## 1.14.16 — 2026-08-09
+
+### Changed
+- **Cyberpunk / Matrix art direction** for README showcase: factory ruins,
+  unfinished towers, neon rain, code-rain sky — EN and RU sets.
+- **Language-split images:** `docs/images/*` = English labels; `docs/images/ru/*`
+  = Cyrillic labels. `README.ru.md` points only at the RU set.
+- Shared lang-neutral art (banner, CLI constellation brand orbs) stays identical
+  in both folders.
+
+## 1.14.15 — 2026-08-08
+
+### Changed
+- **GitHub presentation polish:** showcase EN/RU README (banner, feature strip,
+  CLI constellation, for-the-badge shields, FAQ details, star CTA).
+- New art: `docs/images/00-banner.jpg`, `05-cli-constellation.jpg`, `06-feature-cards.jpg`.
+- Community health: CONTRIBUTING / SECURITY / CODE_OF_CONDUCT rewrite; PR + issue
+  templates; issue config links.
+
+## 1.14.14 — 2026-08-08
+
+### Changed
+- **README EN/RU:** upfront section **CLI agents we plug into** — Claude Code
+  (required PM) + optional Codex / Qwen / Grok / Kimi / AGY writers, one conveyor.
+
+## 1.14.13 — 2026-08-08
+
+### Changed
+- **README (EN + RU only)** rewritten for beginners: full conveyor mental model,
+  day/night, role agents, adoc, FAQ; matches v1.14.x system (`cc` → 1, run-supervisor,
+  general-purpose allowlist, etc.).
+- **New docs/images/** hero + how-it-works + day-night + task-contract artwork.
+- Removed extra-language README.* (de/es/fr/ja/ko/pt-BR/zh-CN).
+
+## 1.14.12 — 2026-08-08
+
+### Changed
+- **dev-orchestrator Agent allowlist** includes native built-ins Claude Code
+  expects: `Explore`, `Plan`, **`general-purpose`**, plus conveyor role agents.
+  Product code still must go through `run-supervisor` (not GP as daytime writer).
+  Docs-aligned with https://code.claude.com/docs/en/sub-agents#general-purpose
+
+## 1.14.11 — 2026-08-08
+
+### Fixed
+- **dev-orchestrator boot**: no fake `claude session rename` (does not exist).
+  Document launch `--name lane-pm-<folder>`; one compact `resume-project` only.
+
+## 1.14.10 — 2026-08-08
+
+### Fixed
+- **PreToolUse `guard_shell.py: not found`**: settings had a *relative*
+  `hooks/guard_shell.py` path. Claude runs hooks with project cwd, so boot
+  Bash (`pwd`, `resume-project`) failed the hook from `~/apps/...`.
+  `merge_claude_settings.merge_guard` now always stores an **absolute** path.
+
+## 1.14.9 — 2026-08-08
+
+### Changed
+- **Standardized Claude agents by conveyor role** (not model brand):
+  - `emergency-writer` (was `codex-implementer`)
+  - `night-reviewer` (was `codex-reviewer`)
+  - `project-onboarder` (was `codex-onboarder`)
+  - `docs-maintainer` (was `codex-docs-maintainer`)
+  - `lane-supervisor` remains canonical; `grok-implementer` is a **deprecated alias**
+  - Old `codex-*` names remain as thin compat aliases for one transition period
+- Daytime write never maps to `*-implementer`: always `run-supervisor` + process
+  from adoc (`qwen`/`grok`/`codex`/…). Documented in `agents/claude/README.md`,
+  ROUTING, SOLO, PLATFORM-CAPABILITIES, agents-doctor, profiles.
+
+## 1.14.8 — 2026-08-08
+
+### Added
+- **`docs/PLATFORM-CAPABILITIES.md`** — Claude Code 2.1.22x + Codex 0.146/0.147
+  feature matrix mapped to the lane conveyor (what we use / deliberately skip).
+- **Claude settings capability pack** (`merge_stack_capabilities`): env defaults
+  (agent teams flag, tool search, MCP timeouts), permission allow for
+  `SendMessage` / `ListAgents` / `TaskStop` / `Monitor` / `Artifact`; optional
+  `LANE_CROSS_SESSION_INBOUND` / `LANE_CROSS_SESSION_DIALOG_EXPIRY`.
+- **Native `codex exec review`** path in `codex-reviewer` (MODE=branch).
+- PM boot: session name `lane-pm*` for ListAgents / Remote Control addressing.
+
+### Fixed
+- **Codex ≥0.147 removed `codex exec --full-auto`.** Implementer / docs-maintainer
+  now use `approval_policy=never` + `--sandbox workspace-write`.
+- Night review forces `--disable multi_agent` / `multi_agent_v2` (stack owns DAG).
+
+### Changed
+- `skills/codex` pins + changelog-watch for 0.146.1 / 0.147.0 (review, plugins,
+  full-auto removal, fast_mode docs).
+
+## 1.14.7 — 2026-08-08
+
+### Fixed
+- **Claude Agent correct close** (Claude Code 2.1.22x): agents complete as
+  **done**, not parked **idle**. Idle + Esc produced «N background agents were
+  stopped by the user». Stack agents now have explicit completion sections,
+  `background: true`, and `maxTurns` caps.
+- **`run-supervisor` tool name:** `send_message` → **`SendMessage`** (official
+  tool; progress lines to PM).
+
+### Added
+- **`TaskStop` / `SendMessage` / `ListAgents`** on `dev-orchestrator` for stuck
+  cleanup and optional operator Remote Control alerts (`name [ref]`, CC 2.1.225).
+- Docs: agent lifecycle + where peer messaging fits (not the write conveyor) in
+  `orchestrator-lanes`, `SOLO-ORCHESTRATION`, agent prompts.
+
+## 1.14.6 — 2026-08-08
+
+### Changed
+- **Claude Agent idle noise:** `dev-orchestrator` + `orchestrator-lanes` prefer
+  one-shot teammates (`DONE|FAILED` + evidence path), deploy via Bash+log not
+  long-lived Agents; idle UI is not a liveness signal. `run-supervisor` ends with
+  a single `DONE … controller.json` line then stops (no parked idle wait).
+
+## 1.14.5 — 2026-08-08
+
+### Changed
+- **Lane report identity is control-plane stamped.** `TASK_ID` + `PROMPT_SHA256`
+  are written by `lane-session` from the launch context (hash of `prompt.md` +
+  task id). The model **must** provide only `STATUS` (+ body). Wrong/missing/
+  typo’d SHA from the LLM no longer fails the lane. Wrong `TASK_ID` still fails
+  (real confusion). Boundary prompt updated: “Do not invent PROMPT_SHA256”.
+
+## 1.14.4 — 2026-08-08
+
+### Fixed
+- **Codex lane report `PROMPT_SHA256` typos** (interim recovery before 1.14.5 stamp).
+- **`lane-ctl` trust** accepts embedded expected digest.
+
+### Changed
+- **No conveyor bypass** documented in `orchestrator-lanes` + `dev-orchestrator`:
+  while controller is live, PM must not hand-run L1, forge receipts, or use
+  `codex-implementer` except after terminal block — typed recovery only.
+
+## 1.14.3 — 2026-08-08
+
+### Changed
+- **`verification[].timeout_sec` is optional.** Control plane defaults to **900s**
+  (`verification_safety.resolve_verification_timeout`). PM/writers should **omit**
+  the field — stop inventing `timeout_sec: 900` in every task YAML. Schema,
+  `lane-ctl`, `run-validate`, templates, and `lane-contract` skill updated.
+
+## 1.14.2 — 2026-08-08
+
+### Added
+- **Codex Fast mode in adoc / lanes** (`writer.service_tier: standard|fast`).
+  Independent of model (luna/terra/sol) and reasoning effort. When `fast`,
+  `lane-session` passes `service_tier="fast"` + `--enable fast_mode` to
+  `codex exec` (~1.5× speed, ~2.5× ChatGPT credits on GPT-5.6). Default for
+  durable writers remains **standard** (host interactive `/fast` does not leak
+  into the ephemeral lane-writer profile).
+- adoc Coder tab: **Fast mode** toggle when provider is Codex; CLI
+  `--service-tier` / `--fast-mode` / `--no-fast-mode`; profile field
+  `writer.service_tier`.
+
+## 1.14.1 — 2026-08-08
+
+### Changed
+- **Plan critique actually runs the LLM** when `stages.plan_critique.provider` is
+  `qwen` / `codex` / `kimi` / `grok` / `agy` (not only a prompt file). Structural
+  + LLM findings merge into `artifacts/critique.json` with a PM **`decision`**:
+  `ship` | `revise` | `revise_required` and `pm_action` text.
+- **Orchestrator must honor decision:** skill + `dev-orchestrator` require reading
+  critique after `plan-critique` / pre-dispatch; `revise_required` blocks writer
+  dispatch until contracts are fixed and critique re-run (or gate `--ack`).
+- **`run-validate --phase pre-dispatch` auto-runs** `plan-critique` when the
+  artifact is missing and the stage is enabled.
+- New module: `bin/plan_critique_llm.py` (safe-mode one-shots, JSON parse).
+
+## 1.14.0 — 2026-08-07
+
+### Added
+- **Plan critique stage** (`plan-critique` CLI + `stages.plan_critique` in routing profile): structural pre-dispatch review of PLAN/SPEC/tasks; writes `artifacts/critique.json` + `critique.md`; optional cheap-model prompt when provider ≠ `structural`. Modes: `advisory` (warn) | `gate` (block `run-validate --phase pre-dispatch` until pass/ack).
+- **Pipeline stages** in `.agents/routing.profile.yaml`: `plan_critique`, `write`, `night_review`, `specialist` — each with its own provider/model/effort. Configure in **adoc TUI → Stages** or CLI `--plan-critique*`.
+- **adoc TUI conveyor:** new **Stages** tab, live pipeline strip (PM › crit › write › L1 › night), modern stage cards, per-agent customization, EN/RU strings. Tabs renumbered 1–7 (Apply = 7).
+
+### Changed
+- `run-validate` pre-dispatch honors plan_critique gate; advisory missing critique is a WARN.
+- `agents-doctor --apply` writes `stages:` block; night-shift written before routing so stages stay consistent.
+
+## 1.13.6 — 2026-08-03
+
+### Changed
+- **statusLine dual-mode:** normal Claude Code sessions → **stock claude-pulse** (full user config). **dev-orchestrator** / frontend-orchestrator / run-supervisor / lane-supervisor → native lane HUD (bars + peak + HANDOFF). Router: `LANE_STATUSLINE_ENGINE=auto|lane|pulse`.
+
+## 1.13.5 — 2026-08-03
+
+### Fixed
+- **Peak / off-peak burn indicator restored** on native statusLine (`⚡Peak 2h` / `⚡in 45m` / `Off`) — was dropped when claude-pulse was replaced. Weekdays 13:00–19:00 local (Anthropic policy); weekends Off. Toggle: `LANE_STATUSLINE_PEAK=0`.
+
+## 1.13.4 — 2026-08-03
+
+### Added
+- **Native statusLine bars (no claude-pulse).** `lane-statusline` + `lane_statusline_lib.py` render S/W/C + cost from Claude Code stdin (`rate_limits`, context, cost) and append the HANDOFF chip. Users without claude-pulse get working bars after `./install.sh` (wires `~/.claude/settings.json` statusLine). Last-known usage cache: `~/.agents/statusline/`. Modes: `LANE_STATUSLINE_MODE=compact|bars|chip|full`.
+
+### Changed
+- `install.sh` / `merge_claude_settings.py` now set `statusLine` → `~/.agents/bin/lane-statusline` (stack-owned HUD).
+
+## 1.13.3 — 2026-08-03
+
+### Changed
+- **`lane-statusline` 2-in-1 (default compact):** short claude-pulse wrapper **plus** HANDOFF chip (superseded by native bars in 1.13.4).
+
+## 1.13.2 — 2026-08-03
+
+### Added
+- **`lane-statusline`**: Claude Code `statusLine` wrapper — keeps claude-pulse usage bars and appends a factory chip from `.agents/HANDOFF.json` (`main_write/workspace`, active run, blocked count, next_act). Wired in host `~/.claude/settings.json`.
+
+## 1.13.1 — 2026-08-03
+
+### Fixed
+- HANDOFF refines `verification_failed` from verify stderr → `verification_script_missing` / `fix_contract` when check.py missing.
+
+## 1.13.0 — 2026-08-03
+
+### Added
+- **Day-path handoff:** `handoff-write` builds `.agents/HANDOFF.json` + `HANDOFF.md` (now / blocked / next acts / profile). Auto-refresh when a run becomes terminal (`run-controller`) and on `run-finalize`. `resume-project` defaults to **compact** (HANDOFF-first); `--full` for legacy dump.
+- **Contract failure policy:** verify failures classified as `verification_script_missing` (missing check.py etc.) skip blind retry and block immediately with handoff `next_act: fix_contract` — keeps daytime fast (write→L1→accept; LLM review stays night-only).
+
+## 1.12.9 — 2026-08-03
+
+### Fixed
+- **PM may Write pre-authored L1 `check.py`.** Guard previously blocked all `.py` and everything under `artifacts/`, so dev-orchestrator could not pre-author verification scripts (skills required them; guard forbade them). Allow only basename `check.py` at `.agents/runs/<slug>/check.py` or `.../artifacts/<task_id>/check.py` (also under `.worktrees/<wt>/...`). Still deny `state.json`, reports, `helper.py`, production source.
+
+## 1.12.8 — 2026-08-03
+
+### Fixed
+- **Worktree verification path footgun (temples-admin class).** `run-validate --phase pre-dispatch` now rejects verification commands whose script args (e.g. `.agents/runs/.../check.py`) are **missing under `verification.cwd`**. Skills (`orchestrator-lanes`, `lane-contract`) + `dev-orchestrator` document: copy pre-authored checks into the worktree before dispatch, or use product `tests/`, or `adoc` in_place — never assume main `.agents` is visible from the worktree.
+
+## 1.12.7 — 2026-08-03
+
+### Fixed
+- **adoc TUI crash on Russian Apply tab:** `tr()` first arg was named `lang`, so `apply_lang` format kwarg `lang=` raised `got multiple values for argument 'lang'`. Renamed to `ui_lang`.
+
+## 1.12.6 — 2026-08-03
+
+### Added
+- **TUI languages EN + RU** (tab **UI**, hotkey **L**). All tabs/labels/help switch live; preference saved as `ui.language` in the project profile and as global default `~/.agents/doctor.ui.yaml` on Apply. Run/task YAML stay English.
+
+## 1.12.5 — 2026-08-03
+
+### Added
+- **Workspace mode in `adoc` TUI (tab Work)** and routing profile: `workspace.mode` = `in_place` | `worktree` | `auto`, plus auto thresholds (`worktree_min_score`, `worktree_on_multi_write`). Writers can edit the main checkout or always use isolated worktrees; auto keeps the old score/multi-write heuristic. CLI: `--workspace-mode`, `--worktree-min-score`, `--worktree-on-multi-write`. `run-init` stamps `workspace` on `run.yaml` and hints when profile prefers worktree but init is in-place.
+
+## 1.12.4 — 2026-08-03
+
+### Fixed
+- **Codex as daytime primary writer actually trusts and accepts.** `lane-ctl` previously only trusted the Sol+high *fallback* shape, so `adoc` `main_write: codex` (luna+max) finished exit 0 with a complete report but was classified `provider_incomplete` / `runtime_identity_mismatch`, and retries failed with «recorded Codex fallback profile is invalid». Trust and retry now accept primary Codex with model/effort from control (adoc profile); Sol+high remains required only for real fallback attempts (`fallback_of_attempt`). Aligns `lane-ctl` with adoc / `routing_profile` / orchestrator-lanes skills.
+
+## 1.12.3 — 2026-08-03
+
+### Changed
+- **agents-doctor TUI Coder tab: form + drill-down lists.** ↑↓ only moves between fields (Provider / Model / Effort). Enter opens a full option list; ↑↓ there pick a value; Enter confirms; Esc/← back. No more multi-level value-cycling on the same arrows. Shortcuts: `p`/`m`/`e` open that field’s list.
+
+## 1.12.2 — 2026-08-03
+
+### Changed
+- **agents-doctor / adoc is source of truth for the daytime writer.** `run-controller` defaults provider/model/effort from `.agents/routing.profile.yaml` when CLI flags are omitted. `run-validate` rejects tasks whose `lane:` ≠ `main_write`. `run-init` seeds `lane: {{main_write}}` from the profile. PM skills/agents updated: never hardcode `lane: kimi`.
+
+## 1.12.1 — 2026-08-03
+
+### Fixed
+- **agents-doctor TUI apply no longer floods the screen.** Writes use `quiet=True` (stdout redirected); after successful Apply the UI closes and prints a clean summary outside fullscreen. Enter on Apply = save & exit.
+
+## 1.12.0 — 2026-08-03
+
+### Added
+- **`agents-doctor` full-screen TUI** (`agents-doctor` / `agents-doctor tui`) — tabs for Coder / Night / Status / Apply, live summary strip, keyboard-first UX (↑↓ provider, `m`/`e` model & effort, Enter apply). Linear `setup` wizard and `--apply` flags remain for scripts/CI.
+- **Codex as selectable daytime writer** (`--writer-provider codex` / TUI “Codex”). Defaults to **`gpt-5.6-luna` + reasoning effort `max`**; model/effort stored under `writer:` in `.agents/routing.profile.yaml`.
+- **Bare Codex lane-writer profile** (`profiles/codex/lane-writer.config.toml`): ephemeral `CODEX_HOME` with auth + minimal config only; host MCP/plugins/user skills excluded; `--profile lane-writer` + feature disables for headless task runs.
+- **Per-project writer model & effort** in routing profile (`writer.model`, `writer.reasoning_effort`); `run-supervisor` passes `--model` / `--reasoning-effort` to `run-controller`.
+- **`bin/night-shift-logs`** — quick tail of per-project + combined night-shift logs.
+
+### Changed
+- `lane-ctl` / `run-controller`: `codex` in `PRIMARY_MODELS` (default model luna); reasoning efforts include `xhigh`/`max`; per-provider default efforts (`codex` → `max`).
+- `night-shift` / `night-shift-all` / `night-fix-runner` accept `codex` as fix writer provider.
+- `project-onboard` opens agents-doctor TUI on a TTY (falls back to setup / non-interactive flags in CI).
+- `orchestrator-lanes`: selectable writers include codex; default remains project `main_write` or kimi.
+
+### Fixed
+- TUI layout: single-column layout (no broken box-drawing / side-panel collision on narrow terminals).
+- Codex writer home: bare profile applied via scratch `CODEX_HOME` + bwrap mask of host `~/.codex`.
+
+### PM decomposition skill + pre-dispatch gates (2026-07-30)
+
+- Professional `orchestrator-lanes` + `lane-contract`: one-outcome tasks, unlock vs feature, owns completeness, owns-noise recovery (never cache-in-owns).
+- `run-validate`: reject stub SPEC when score≥7 or ≥2 tasks; reject unscoped full-package L1 on multi-task score≥7.
+- SPEC template structured (Goal/Interfaces/Invariants/Out of scope/Done).
+
+### Codex effort budget (2026-07-30)
+
+- Default Codex reasoning is **high** (or **medium** for low-risk / minimal onboard), not xhigh.
+- Removed fast_write → expensive effort mapping; xhigh only on explicit escalate.
+- Night-review profile + engine use sol + high. ADR: docs/decisions/ADR-codex-effort.md.
+
+### Control plane stability (2026-07-30)
+
+- run-controller: partial-block — one task blocked no longer freezes runnable siblings; upstream-blocked dependents cascade to blocked.
+- check-owns-paths: foreign dirt ignored; dirt-baseline at lane-ctl start catches new writer leaks.
+- Verification tiers L0/L1/L2 documented in writer, templates, skills, SOLO; run-validate warns on heavy multi-task L1.
+- Agents/skills aligned: roles matrix, silence/receipt protocol, typed recovery only.
+
+# Changelog
+
+## 1.11.1 — 2026-07-29
+
+### Fixed
+- **Dev orchestrator can no longer bypass the required run supervisor.**
+  `orchestrator-lanes` now makes exactly one `run-supervisor` mandatory for
+  every controller run, including the micro path. A shared Claude
+  `PreToolUse` guard blocks direct `run-controller start/watch/status` calls
+  from `dev-orchestrator` and returns the correct supervisor dispatch contract.
+
+## 1.11.0 — 2026-07-27
+
+### Changed
+- **`gate-triage` analysis moved from qwen to Codex Sol high.** The weekly gate
+  review now runs `codex exec --ephemeral --ignore-user-config --model
+  gpt-5.6-sol -c model_reasoning_effort="high" --sandbox read-only` in a
+  throwaway empty cwd, feeds the prompt on stdin, and reads the final message
+  back through `--output-last-message` instead of scraping a provider event
+  stream — so `parse_qwen_stream` is gone. Local schema validation still gates
+  the result, and a failed analysis still fails closed without touching code.
+  New flags: `--reasoning-effort` (default `high`), `--codex-bin`
+  (`GATE_TRIAGE_CODEX_BIN`), `--repair-provider` (default `kimi`); `--qwen-bin`
+  is removed.
+- **Analysis and repair are now split by design:** review-grade Codex reasoning
+  classifies the recurring gate blocks, and a cheaper writer lane (default
+  `kimi`) executes the bounded fix chain.
+
+## 1.10.1 — 2026-07-27
+
+### Changed
+- **`night-shift` / `night-shift-all --provider` accept `qwen` and `kimi`.**
+  `night-fix-runner` already handled both, but the nightly entrypoints clamped
+  the choice to `agy|grok`, so the selectable repair writers were unreachable
+  from cron. Default stays `grok`.
+
+## 1.10.0 — 2026-07-27
+
+### Added
+- **Kimi writer lane (`--provider kimi`).** `kimi-code` joins qwen/grok/agy as a
+  switchable primary writer: `lane-session` builds `kimi -p … --model … -r
+  <session>` (kimi rejects `--yolo`/`--auto` with `-p` and auto-approves tools in
+  prompt mode anyway), consumes its role-based `stream-json`, and reuses warm
+  sessions through the `session.resume_hint` id. Default model
+  `kimi-code/k3-256k`; profile `claude-kimi`; `agents-doctor` detects the binary
+  and requires the same bubblewrap boundary as the other writers. Receipts record
+  `permission_mode: headless-auto` and `provider_sandbox: off`, and `lane-ctl`
+  plus the board enforce that policy pair on accept.
+- **Thinking-effort mapping for kimi.** kimi exposes effort only through the
+  environment, so the lane maps `--reasoning-effort low|medium|high` onto
+  `KIMI_MODEL_THINKING_EFFORT` (`low|high|high`) and sets `KIMI_DISABLE_CRON=1`.
+
+### Changed
+- **Kimi is now the default writer.** `lane-ctl start`, `run-controller run`, and
+  `run-controller start` default to `--provider kimi`; `agents-doctor` auto-picks
+  Kimi before Qwen/Grok/AGY, and the `full` profile ships `fast_write`/
+  `main_write: kimi`. Qwen stays selectable with `--provider qwen`. Legacy
+  artifacts without a recorded `provider` still resolve to `qwen`, so older runs
+  keep verifying and accepting unchanged.
+- `~/.kimi-code` is masked inside every other writer's sandbox, and kimi's own
+  sandbox masks `~/.codex`, `~/.gemini`, `~/.grok`, and `~/.qwen`.
+- `night-fix-runner --provider` and night-fix lanes accept `kimi`.
+
+### Known limits
+- kimi emits no init event, effective-model echo, permission-mode echo, or usage
+  payload, so kimi receipts carry no token/cost fields and cannot fail closed on
+  a model mismatch the way qwen/agy/grok do. Acceptance rests on exit code 0 plus
+  one task-bound report envelope.
+
+## 1.9.0 — 2026-07-24
+
+### Added
+- **`gate-triage`: weekly autonomous gate review + repair.** Reads the
+  gate-event log (last N days), feeds the blocking events to a **read-only qwen
+  analysis** (isolated empty cwd, `--output-format stream-json`, result
+  validated against `schemas/gate-triage-result-v1.schema.json`), and persists
+  recurring false-positive / tooling findings as canonical `finding-v1` records
+  in the tool repo's `.agents/findings/` (fingerprint-dedup, atomic, first_seen
+  preserved). Writes `~/.agents/logs/gate-triage/GATE-TRIAGE-<date>.md` (+
+  `.json`) and a backlog block into `agent-notes/OPEN.md`. Unless `--no-repair`,
+  it then reuses the existing repair chain — `wt-create` →
+  `night-review-engine compile-fixes` → `night-fix-runner --provider qwen` — so
+  the fix lands in an isolated worktree with verify + fresh re-review + accept;
+  merge only when `.agents/night-shift.yaml auto_merge: true` (`--auto-merge`
+  enables it). A failed analysis fails closed and never touches code. Schedule:
+  weekly cron (see `docs/LANE-EXEC.md`).
+- **`schemas/gate-triage-result-v1.schema.json`:** qwen triage output schema
+  (classified, actionable findings with fix scope + verification).
+- **Shared gate aggregation** (`load_events`/`aggregate`/`window_cutoff`) moved
+  into `bin/gate_log.py`; `gate-report` now imports it.
+
+### Changed
+- **`night-fix-runner --provider` accepts `qwen`** (in addition to `agy`/`grok`);
+  qwen-lane tasks and qwen provider receipts were already handled internally.
+
+## 1.8.0 — 2026-07-24
+
+### Added
+- **Gate observability:** every gate evaluation now appends one line to a
+  durable, append-only `~/.agents/logs/gate-events.jsonl` (schema
+  `schemas/gate-event-v1.schema.json`). Instrumented gates: `check-owns-paths`
+  (owns-paths), `run-validate` (validate), `lane-ctl accept` (accept), and
+  `lane-ctl verify` (verification), all through the shared best-effort
+  `bin/gate_log.py` — a failed write never breaks the gate. Override the path
+  with `CLAUDE_LANE_GATE_LOG`; set it to `off` to disable (the test suite does,
+  via `tests/__init__.py`, so fixtures never pollute the real log).
+- **`gate-report`:** weekly review CLI over the gate-event log — per-gate
+  pass/reject/fail counts, top `owns_paths` violations, top `never_touch` hits,
+  top blocking reasons, and a per-project breakdown, in markdown or `--json`,
+  with `--days` / `--project` / `--gate` filters. The loop for catching
+  recurring blocks and false positives, then fixing contracts or gates.
+- **`docs/LANE-EXEC.md`:** new "Gate observability" section.
+
+### Fixed
+- **`check-owns-paths` ignores root living-memory files** (`PROGRESS.md`,
+  `LESSONS.md`). The shared session-ledger hook flushes `PROGRESS.md` from any
+  concurrent orchestrator/supervisor session in the same worktree; the gate only
+  filtered directory prefixes (`.agents/`), so an unrelated flush could block a
+  clean writer task with a false `owns_paths` violation. These files are
+  orchestration-managed and never a parallel-writer collision source.
+
+## 1.7.0 — 2026-07-23
+
+### Added
+- **Per-task outcome manifest:** at every terminal task transition
+  (accepted/blocked) `run-controller` now writes
+  `artifacts/<task_id>/outcome.json` — a CLI-agnostic result manifest aggregating
+  `owns-check.json`, `report.md`, and controller state into one supervisor-facing
+  file: `exit_status` (completed/crashed/timeout/blocked), `failure_class`,
+  `files_changed`, `report_sha256`, attempts, and fallbacks. The write is
+  fail-safe: a missing artifact never breaks the durable controller.
+- **Supervisor outcome contract:** `dev-orchestrator` must read every task's
+  `outcome.json` and may only ship a run when all outcomes are `completed`;
+  `run-supervisor` returns the run `artifacts/` dir, and `lane-supervisor` treats
+  `outcome.json` as the authoritative crash / files-changed evidence instead of
+  re-deriving it from logs.
+- **`schemas/outcome-v1.schema.json`:** strict schema for the manifest. The
+  `provider` field is open (any string) so future writers (qwen, opencode)
+  validate without schema changes.
+- **Qwen writer provider (new default primary coder):** `qwen` is now a
+  first-class switchable writer. `lane-session` drives
+  `qwen --yolo --output-format stream-json` (a Claude-Code-compatible stream:
+  `system/init` → `assistant` → `result`), validates the effective model and the
+  `yolo` permission mode, reuses run-scoped sessions via `--resume`, classifies
+  qwen failures for retry/Codex fallback, and isolates qwen in the same
+  Bubblewrap boundary (`~/.qwen` + cwd writable, other providers hidden).
+  `run-controller` and `lane-ctl` default to qwen (`qwen3.8-max-preview`);
+  `agents-doctor` detects qwen and prefers it (Qwen → Grok → AGY); the `full`
+  profile, routing table, and supervisor contracts now name qwen as the writer.
+  Auth rides `BAILIAN_TOKEN_PLAN_API_KEY` / `DASHSCOPE_API_KEY`.
+
+## 1.6.0 — 2026-07-21
+
+### Added
+- **Switchable writer provider:** daytime and night repair runs accept
+  `--provider agy|grok`; AGY defaults to `gemini-3.6-flash-high`, while the
+  existing Grok 4.5 path and historical receipts remain supported.
+- **Typed AGY runtime:** AGY runs through `stream-json`, resumes its
+  run-scoped conversation, validates the exact model and permission mode, and
+  verifies the installed custom-agent allowlist before every launch.
+- **AGY capability checks:** `agents-doctor` requires the exact 3.6 model, the
+  installed `agy-writer` profile, and the existing Bubblewrap boundary before
+  routing work to AGY.
+
+## 1.5.7 — 2026-07-20
+
+### Fixed
+- **Daytime run progress is visible while Grok works:** human-readable
+  `run-controller watch` calls now stream observed controller transitions
+  immediately while preserving the single-receipt JSON mode for automation.
+- **The PM cannot replace the visible supervisor with a silent polling loop:**
+  the dev-orchestrator contract requires the terminal `run-supervisor` digest.
+
+## 1.5.6 — 2026-07-19
+
+### Fixed
+- **Large verification receipts no longer deadlock the run controller:**
+  asynchronous `verify` and `accept` actions spool stdout and stderr to
+  temporary files instead of unread pipes, so output larger than the kernel
+  pipe buffer still advances immediately from verification to acceptance.
+
+## 1.5.5 — 2026-07-19
+
+### Fixed
+- **Grok lanes retain DNS inside the outer sandbox:** when the host
+  `/etc/resolv.conf` points into `/run`, `lane-session` recreates only the
+  required parent directories and read-only binds the resolved file target.
+  Private runtime directories, host sockets, and the `.agents` control plane
+  remain isolated.
+- **DNS/OIDC startup failures enter typed recovery:** bounded provider evidence
+  for resolver and token-refresh failures is classified as an eligible Grok
+  bootstrap failure, allowing the existing retry-once and Codex Sol high
+  recovery path without storing raw stderr.
+- **Doctor verifies the real resolver boundary:** Grok routing now requires a
+  structural resolver probe under the same Bubblewrap namespace shape instead
+  of accepting a `/bin/true` sandbox false positive.
+- **CI is a release-quality gate:** GitHub Actions installs runtime test
+  prerequisites and runs Python, shell, and Lane Board suites.
+
+## 1.5.4 — 2026-07-18
+
+### Fixed
+- **Packaged Codex binaries survive credential isolation:** the fallback resolves
+  the standalone CLI before hiding the host `~/.codex`, then exposes only that
+  executable through a read-only sandbox mount. Host Codex credentials and
+  configuration remain hidden.
+- **Codex version receipts tolerate safe launcher warnings:** bounded version
+  output is scanned for the sanitized semantic version instead of assuming it
+  is always the first line.
+
+## 1.5.3 — 2026-07-18
+
+### Added
+- **Typed provider recovery:** daytime and night repair runs retry the exact
+  Grok 4.5 request once, then allow one fixed `gpt-5.6-sol` high-effort writer
+  attempt only for classified model/catalog/quota/auth/transport failures.
+- **Provider-aware receipts and UI:** runtime, acceptance, controller state,
+  and Lane Board details expose the actual provider, model, sanitized failure
+  class, and fallback eligibility without silently substituting models.
+
+### Changed
+- **Codex fallback is isolated and bounded:** it runs ephemerally with a private
+  minimal `CODEX_HOME`, subagents disabled, workspace-write sandboxing, and the
+  same immutable prompt/report/ownership/verification/acceptance chain.
+- **Provider credentials stay separated:** Grok never receives OpenAI auth, and
+  Codex never receives Grok/xAI auth or the host Codex home.
+- **Retry is durable rather than blocking:** the controller persists a retry
+  deadline, frees the provider slot, and resumes eligible work only when shared
+  provider capacity is available, without a sleep loop or Claude polling agent.
+- **Grok error events are typed:** zero-exit rate-limit/model/settings events
+  cannot bypass availability classification or incorrectly suppress fallback.
+- **Night review stays independent:** a recovery write still requires fresh
+  Codex Sol xhigh re-review before acceptance; verification or ownership
+  failures never trigger provider substitution.
+
+## 1.5.2 — 2026-07-18
+
+### Fixed
+- **Lane Board cards stay inside their columns:** task cards can shrink around
+  long runtime details without covering neighbouring lanes at desktop or
+  tablet widths.
+- **The dashboard mirrors fail-closed acceptance:** task details validate the
+  current attempt, runtime identity, terminal protocol, sandbox contract, and
+  prompt/report digests before presenting a provider report as complete.
+- **Project discovery skips non-project data trees:** recursive scanning prunes
+  `.agents`, `.git`, `node_modules`, and `postgres_data`, eliminating repeated
+  permission errors and needless CPU/memory use on broad application roots.
+- **Board assets refresh predictably:** static JavaScript and CSS use
+  `Cache-Control: no-cache`, so a normal reload picks up a new release.
+
+## 1.5.1 — 2026-07-18
+
+### Fixed
+- **Headless Grok no longer cancels on shell approval:** writer lanes use the
+  unattended `bypassPermissions` mode required by Grok Build instead of
+  interactive `acceptEdits`, which cancelled non-auto-approved terminal calls.
+- **The control plane is kernel-enforced read-only to Grok:** an outer
+  Bubblewrap mount protects repository `.agents` while owned source paths stay
+  writable inside the same outer workspace boundary. Grok's native sandbox is
+  disabled inside it so terminal tools are not blocked by nested isolation.
+- **Host pathname endpoints are isolated from writer lanes:** `/run`, `/tmp`,
+  and `/var/tmp` are private mounts, active pathname Unix sockets exposed by a
+  writable bind are masked, and the provider receives an allowlisted
+  environment rather than SSH, D-Bus, Docker, or unrelated host variables.
+- **Reports cross a validated transport:** Grok returns one final envelope bound
+  to task ID and prompt digest; `lane-session` rejects missing, duplicate,
+  malformed, stale, cancelled, oversized, or symlink-targeted reports and
+  atomically materializes canonical `report.md` only after `EndTurn`.
+- **Acceptance is bound to the current attempt:** status, verify, and accept
+  require the current `runtime.json` prompt/report digests; retry archives the
+  old root report and acceptance receipts record `report_sha256`.
+- **Grok routing now probes Bubblewrap:** `agents-doctor` disables writer lanes
+  when the binary exists but cannot create the required sandbox.
+
+## 1.5.0 — 2026-07-18
+
+### Added
+- **Durable daytime run controller:** `run-controller start/watch/status` owns
+  schema-v2 DAG dispatch, separate bounded provider/verification pools,
+  progressive ownership/verification/acceptance, one retry, atomic
+  `controller.json`, duplicate locking, crash receipts, and host-surviving
+  `lane-bg` process lifetime.
+- **One visible supervisor per run:** the source-read-only `run-supervisor`
+  starts or resumes the controller and stays visible through bounded watches
+  until the run is accepted or blocked. `lane-supervisor` remains available for
+  explicit one-lane diagnostics and recovery.
+- **Exact Lane Board observability:** run/task APIs and drawers expose raw
+  lifecycle stage, attempt, PID/liveness, provider exit, heartbeat age, report
+  completeness, reason, next action, and the run controller summary without
+  changing the existing board-column grouping.
+
+### Changed
+- **Day and night are separate loops:** daytime has no LLM review; exact
+  ownership and registered verification drive acceptance and shipping. The
+  existing Codex Sol xhigh review → Grok fix → re-review pipeline remains the
+  independent night shift.
+- **Grok completion is fail-closed:** only `EndTurn` is successful.
+  `Cancelled`, `Error`, and unknown terminal reasons now produce a sanitized
+  protocol failure and non-zero wrapper exit.
+- **A report is mandatory before verify:** provider exit zero without root
+  `report.md` and `STATUS: complete` is `provider_incomplete → retry`, never
+  `awaiting_verification`.
+- **Parallel ownership no longer self-conflicts:** daytime shared worktrees use
+  a receipt-recorded union of all pre-dispatch-validated, disjoint task
+  `owns_paths`; direct and night single-task checks remain task-strict.
+- **Dispatch validation stays fresh:** the controller reruns strict
+  `pre-dispatch` validation at startup and before every dependency-release wave.
+
+## 1.4.0 — 2026-07-18
+
+### Changed
+- **Typed autonomous night shift:** `night-shift` now runs bounded Codex Sol
+  xhigh review chunks, validates JSON-schema output, persists deduplicated
+  `.agents/findings/`, and compiles actionable findings into immutable v2 Grok
+  tasks in an isolated worktree. `night-shift-all --jobs 1..10` coordinates
+  active repositories.
+- **Bounded repair and closure:** `night-fix-runner` resumes from machine
+  receipts, retries Grok at most once, rejects unsafe generated verification,
+  runs ownership + independent verification, requires a fresh Codex re-review,
+  and records standardized finding closure links. Night merge/push is opt-in
+  through `.agents/night-shift.yaml`.
+- **Dedicated Codex reviewer profile:** installer adds
+  `~/.codex/night-review.config.toml` with `gpt-5.6-sol`, `xhigh`, read-only
+  sandbox, and approval policy `never`; unattended invocations ignore unrelated
+  base user config and MCP startup.
+- **Structured Grok runtime:** `lane-session` uses streaming JSON,
+  `--no-subagents`, workspace sandbox rules, bounded logs, protocol fail-closed,
+  and an attempt-local sanitized `runtime.json` while preserving warm-session
+  reuse and the 1–10 slot pool.
+- **Live E2E hardening:** automated Grok and Codex lanes mark their hook
+  processes as orchestration work, preventing global session-ledger hooks from
+  mutating reviewed worktrees. Codex receives an API-compatible projection of
+  the result schema while the engine retains full local JSON Schema validation.
+- **Role-specific skills:** every Claude control/review/fallback subagent now
+  declares a narrow skill allowlist; the dev-orchestrator list is duplicate-free.
+- **Verification is fail-closed:** legacy and v2 `smoke/tests` tasks with an
+  empty recorded command list can no longer receive a passed receipt.
+- **V2 verification is shell-free:** `lane-ctl` validates the executable,
+  arguments, package subcommand, and worktree boundary before provider launch,
+  snapshots the project allowlist into the attempt control receipt, and later
+  executes the parsed argv directly instead of invoking `/bin/bash -c`.
+- **Deterministic bin install:** `install.sh` copies only regular executable
+  files, so local `__pycache__` directories cannot trigger the fallback copy,
+  leak runtime caches into `~/.agents/bin`, or drift installed permissions.
+- **Night-shift release hardening:** stale empty legacy receipts are untrusted,
+  recurring fixed findings reopen, reviewer input is treated as untrusted data,
+  and generated verification rejects shell expansion, globbing, package
+  fetch/install, and worktree escapes.
+- **Versioned run contracts:** `run-init` now generates schema-v2 `run.yaml`,
+  PLAN/SPEC/STATUS views, and a complete task template; `run-validate` gates
+  dispatch and merge with schema, DAG, path-ownership, and receipt checks.
+- **Immutable task lifecycle:** task YAML is hashed at first start; runtime
+  state moved to `state.json`, retries preserve `attempts/NN`, and completion
+  is represented only by `acceptance.json`.
+- **Machine delivery receipts:** ownership, verification, acceptance, merge,
+  local install, and deterministic finalization now have JSON receipts while
+  Markdown files remain concise human views.
+- **Generated status views:** heartbeat no longer appends to STATUS.md;
+  `run-board` rebuilds v2 STATUS/BOARD from state and acceptance, with legacy
+  run fallback in CLI and Lane Board APIs.
+- **Event-driven Grok control plane:** added a source-read-only
+  `lane-supervisor` and typed `lane-ctl` actions for detached start, compact
+  status/events/tail, recorded-argv retry, cancel, and independent verify.
+- **Bounded parallel pools:** Grok writer sessions now default to five slots and
+  support 1–10; verification uses a separate semaphore (default two, max ten).
+- **Deterministic prompts:** `lane-ctl` composes the canonical Grok writer
+  contract with raw task YAML and records control/prompt artifacts per attempt.
+- **Lifecycle correctness:** `lane-exec` emits atomic JSONL lifecycle events,
+  preserves child exit codes, and writes final status before closing its log.
+- **Host-surviving detach:** `lane-bg` uses a transient user-systemd service by
+  default and retains an explicit nohup fallback for hermetic tests/older hosts.
+- **Attempt-bound acceptance:** verification now requires provider exit 0, uses
+  the command snapshot captured at start, enforces per-command timeouts, rejects
+  symlink escapes, and cannot survive into a retry. Retry is capped at one and
+  revalidates a duplicate-free argv schema.
+- **Portable session locks:** a read-only `XDG_RUNTIME_DIR` falls back to a
+  private per-user lock directory under `/tmp`.
+- **Grok is the only write programmer.** Removed write-lane CLI integrations and
+  docs for the retired fast-write path. `agents-doctor` / profiles / implementer
+  routing use Grok only; Codex remains review and write fallback.
+- **Progressive MODE defaults:** grok/codex implementers use smart MODE when
+  omitted (≥2 task YAML → `start`, single → `full`). PM skill forbids N×
+  `MODE=full` on multi-task runs; dispatch must pass `RUN_DIR` + explicit MODE.
+  Hard rule on multi-full join-wait in `dev-orchestrator` + `orchestrator-lanes`.
+
+
+## 1.3.1 — 2026-07-16
+
+Hardening progressive accept: anti-join guard + detached heartbeats.
+
+### Added
+- **`lane-mode-check`**: refuses `MODE=full` when a run has ≥2 task cards (exit 2 / `refused_full_on_multi_task`). Implementers call it in preflight. Override: `LANE_ALLOW_FULL=1`.
+- **`lane-exec` auto-heartbeat**: with `--heartbeat path`, writes `heartbeat.json` on real activity (stdout/CPU, throttled) so `lane-stall-check` works after `MODE=start`.
+- **`tests/test_progressive_accept.sh`**: fixtures for mode-check, progressive poll accept-while-sibling-runs, and heartbeat write.
+
+### Changed
+- grok/codex implementers + orchestrator-lanes / dev-orchestrator / LANE-EXEC docs document the hard guard and detached heartbeat.
+
+## 1.3.0 — 2026-07-16
+
+Progressive accept: no more join-wait on multi-task waves.
+
+### Added
+- **`lane-poll`**: multi-artifact poll for a run (`finish_ready` = CLI done, no report yet). PM uses it to accept tasks as they complete.
+- **Implementer MODE** (`start` | `finish` | `full`) on grok/codex implementers: multi-task fire-and-return start, then finish for report; `full` remains for micro/single-task.
+
+### Changed
+- **Progressive accept is mandatory for ≥2 write tasks**: never wait for the slowest concurrent lane before accepting finished ones; free slots and pipeline the next ready task (still ≤3 concurrent). See `skills/orchestrator-lanes/SKILL.md`, `agents/claude/dev-orchestrator.md`, `docs/LANE-EXEC.md`, `docs/ROUTING.md`, `docs/SOLO-ORCHESTRATION.md`, `docs/FILE-CONTRACT.md`.
+
+## 1.2.0 — 2026-07-13
+
+Nightly-only review, micro path, Lane Board dashboard, warm sessions.
+
+### Added
+- **Diff-scoped review SPEC**: `BASE_REF` is required and the supervisor constructs `SPEC` from the task's changed paths, so reviewers inspect only the scoped diff and direct dependencies, never repo-wide context. See `agents/claude/codex-reviewer.md`, `agents/codex/instructions/reviewer.md`.
+- **Nightly medium-tier review**: Medium changes merge after report + `check-owns-paths` + verify; review runs off the critical path in the nightly `night-review` batch, findings become morning fix tasks, and strong review remains synchronous pre-merge. See `docs/ROUTING.md`, `docs/SOLO-ORCHESTRATION.md`, `skills/orchestrator-lanes/SKILL.md`.
+- **Tiered review policy**: `none` for micro/low, `codex-reviewer` (`gpt-5.6-sol` + `medium`) for `risk: medium`, and `codex-reviewer` (`gpt-5.6-sol` + `high`, escalating to `xhigh` for critical paths) for high-risk/ship; micro commits now include `[micro:<slug>]`. See `docs/ROUTING.md`, `docs/SOLO-ORCHESTRATION.md`, `skills/orchestrator-lanes/SKILL.md`.
+- **Micro path tier** (score 0–2): skips PLAN/worktree/board/heartbeat/reviewer for trivial ≤2-file changes; adds `verify` field (`none`|`smoke`|`tests`) to the task YAML contract. See `docs/ROUTING.md`, `docs/SOLO-ORCHESTRATION.md`, `docs/FILE-CONTRACT.md`.
+- **Run-scoped warm Grok sessions**: `lane-session` resumes native conversations across related tasks, preserves up to three parallel slots, rotates after seven successful tasks by default (hard max ten), and invalidates failed/stale sessions.
+- preflight smoke is cached by CLI version and agent-definition hash instead of spending a model call before every task.
+- **Push-on-merge and meaningful commits**: PM pushes `main` right after merge when a remote exists; commit messages must be meaningful with conventional type(scope) and explanation in body. See `agents/claude/dev-orchestrator.md`, `skills/orchestrator-lanes/SKILL.md`, `docs/SOLO-ORCHESTRATION.md`.
+- **Lane Board** (`board/`): from-scratch read-only dashboard — zero-dependency Node stdlib server + vanilla JS dark UI; projects overview with needs-attention strip, kanban with status-based scope=recent, todos view with full idea bodies, runs timeline, night-review history, Cmd+K search, SSE live refresh; `bin/lane-board` launcher.
+- **Nightly review automation**: `bin/night-review` (per-repo batch review of the day's merged work -> REVIEW-<date>.md with per-run verdicts + Morning fix plan) and `bin/night-review-all` (auto-discovers lane-stack repos, reviews only those active in the last 24h; cron example included); `resume-project` surfaces the newest REVIEW report at session start.
+
+### Changed
+- **Pre-merge review gate removed by default**: solo, no-user-facing context — all review now runs in the nightly `night-review` batch (`none`/`nightly` tiers only); synchronous pre-merge review becomes opt-in per run via `gate: pre-merge` in `run.yaml` (or a project default in PROGRESS.md Pointers before `run-init`). See `docs/ROUTING.md`, `docs/SOLO-ORCHESTRATION.md`, `skills/orchestrator-lanes/SKILL.md`, `agents/claude/dev-orchestrator.md`, `agents/claude/codex-reviewer.md`.
+
+### Fixed
+- Provider output is streamed through `lane-exec` for correct idle detection; interrupted lanes terminate the complete provider process group before releasing a session slot.
+
+## 1.1.0 — 2026-07-11
+
+Deep onboard, dual scenarios, activity-aware lanes, and Claude Bash background survival.
+
+### Docs
+- Full refresh of README (EN/RU) + v1.1.0 blocks on all locale READMEs; BEGINNER EN/RU + locale notes; ROUTING/LANE-EXEC/ONBOARD/COMPARISON/PROJECT-MEMORY/FILE-CONTRACT/llms.txt/install.sh aligned to current product.
+
+## 1.1.0 details
+
+### Changed
+- **Language policy**: all agent-written files English; chat with human Russian (`docs/LANGUAGE.md`).
+
+### Fixed
+- **Lane background under Claude Bash**: long `lane-exec`/`grok`/`codex` must use **`lane-bg`** + poll **`lane-wait --once`**. Foreground Bash is killed ~2 minutes by the host (not lane-exec idle/max). Implementers + dev-orchestrator + LANE-EXEC updated.
+- **lane-exec**: activity-aware timeouts (idle resets on stdout/CPU; absolute max). Replaces hard `timeout 570` in implementers so thinking agents are not killed mid-run.
+
+### Added
+- **Onboard depth** `fast` | `deep` (default: full→deep, minimal→fast):
+  - Forensic deep checklist in Codex `onboard.md` (entrypoints, flows, wiki↔code, verify, ship, secrets)
+  - Auto `deep-scan.md` evidence pack under `.agents/runs/_onboard/artifacts/001/`
+  - Flags: `--deep` / `--fast`, `ONBOARD_DEPTH=`, `/project-onboard deep`
+  - Nested deploy detect (maxdepth 3 compose/Dockerfile) for maturity score
+  - Deep uses **gpt-5.6-sol** high; fast uses terra high
+- **Dual onboard scenarios** (`minimal` vs `full`):
+  - Auto maturity score in `project-onboard` → `.agents/onboard.scenario.yaml`
+  - Override: `--minimal` / `--full` or `ONBOARD_SCENARIO=`
+  - Full seeds: GOTCHAS, GLOSSARY, TESTING, deployment, nested `apps/*/CLAUDE.md`, optional SECURITY
+  - Skip seed when case-insensitive sibling exists (`gotchas.md` vs `GOTCHAS.md`)
+  - Docs: `docs/ONBOARD-SCENARIOS.md`; Codex `onboard.md` + `docs-maintain` scenario-aware
+  - Templates: `GOTCHAS.md`, `GLOSSARY.md`, `TESTING.md`, `deployment.md`
+
+- **GPT-5.6 routing** (Sol / Terra / Luna): no GPT-5.5. See `docs/ROUTING.md`, `profiles/claude-codex.yaml`.
+  - Write default: **terra** (+ xhigh medium); high-risk: **sol** xhigh
+  - Review/ship: **sol** xhigh
+  - Onboard / docs-maintain: **terra** high
+  - Luna: trivia only, not default lanes
+- **Onboard** seeds `docs/ARCHITECTURE.md` + README anamnesis pattern; Codex fills from evidence.
+- **docs-maintainer**: `docs-maintain-project`, `docs-maintain-all`, skill + `codex-docs-maintainer` agent.
+- Templates: `ARCHITECTURE.md`, `README.anamnesis.md`.
+
+### Fixed
+- : ban `call_mcp_tool` / `inheritMcp` on lane agents; grok-implementer preflight.
+
+## 0.1.0
+- Initial public package (file contracts, solo merge, beginner guides).

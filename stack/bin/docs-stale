@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+"""Cited live-pack paths ∩ git diff. No LLM. Exit 0=stale, 2=skip."""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+ARCHIVE_PREFIXES = ("wiki/", "TODO/", "docs/plans/", "docs/compliance/", "docs/seo/")
+_LOCK_NAMES = (
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+    "Cargo.lock",
+    "poetry.lock",
+    "composer.lock",
+)
+OWN_IGNORE_PREFIXES = (
+    "node_modules/",
+    "dist/",
+    "coverage/",
+    ".git/",
+    ".agents/",
+    "vendor/",
+)
+LIVE_EXTRA_GLOBS = (
+    "docs/packages/*.md",
+    "docs/apps/*.md",
+    "docs/components/*.md",
+    "docs/hubs/*.md",
+    "docs/INDEX.md",
+    "docs/ARCHITECTURE.md",
+    "docs/gotchas.md",
+    "docs/glossary.md",
+    "docs/patterns.md",
+    "docs/data-model.md",
+    "docs/RUNBOOK.md",
+    "docs/DESIGN.md",
+    "docs/TESTING.md",
+    "docs/surfaces/*.md",
+    "docs/features/*.md",
+    "docs/processes/*.md",
+    "docs/web.yaml",
+    "apps/*/docs/**/*",
+    "apps/*/CLAUDE.md",
+)
+DEFAULT_LIVE = (
+    "CLAUDE.md",
+    "AGENTS.md",
+    "docs/ARCHITECTURE.md",
+    "docs/DESIGN.md",
+    "docs/RUNBOOK.md",
+)
+YAML_PATH_KEYS = frozenset({"path", "sources", "entrypoints"})
+_FILE_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9._/-])((?:[\w.-]+/)+\w[\w.-]*\.[A-Za-z0-9]+)(?::\d+)?"
+)
+_CITE_LINE = re.compile(
+    r"(?<![A-Za-z0-9._/-])((?:[\w.-]+/)+\w[\w.-]*\.[A-Za-z0-9]+):(\d+)"
+)
+_H2 = re.compile(r"^##\s+", re.M)
+_WORD = re.compile(r"[A-Za-z0-9_]+")
+_CODE_SKIP = (".md", ".markdown")
+_SKIP_COMPLETENESS_NAMES = frozenset({"INDEX.md", "log.md", "llms.txt", "DESIGN.md"})
+# wiki-methodology floors. Active below this is unfinished, not "healthy".
+_KIND_FLOORS: dict[str, dict[str, Any]] = {
+    "unit": {"words": 700, "cites": 12, "headings": ("purpose", "public api", "gotchas")},
+    "surface": {"words": 700, "cites": 12, "headings": ("purpose", "public api", "gotchas")},
+    "feature": {
+        "words": 500,
+        "cites": 10,
+        "rows": 3,
+        "headings": ("what it does", "how it works", "actions", "business rules"),
+    },
+    "hub": {"words": 400, "cites": 8, "headings": ("scope",)},
+    "architecture": {"words": 500, "cites": 12, "mermaid": True, "h2": 3},
+    "gotchas": {"cites": 8, "bullets": 6},
+    "glossary": {"rows": 8},
+    "runbook": {"words": 400, "cites": 6, "h2": 3},
+    "data-model": {"cites": 10, "mermaid": True},
+    "patterns": {"cites": 9, "h2": 3},
+    "process": {"words": 300, "cites": 8},
+    "store": {"words": 400, "cites": 8},
+    "claude": {"words": 150, "cites": 4, "headings": ("owns", "never", "verify", "pointers")},
+    "other": {"words": 400, "cites": 8},
+}
+
+
+def _norm(path: str) -> str:
+    return str(path or "").strip().lstrip("./")
+
+
+def _archive_prefixes(manifest: dict[str, Any] | None = None) -> tuple[str, ...]:
+    extra: list[str] = []
+    for raw in (manifest or {}).get("archive") or []:
+        item = _norm(str(raw)).replace("**", "").rstrip("/") + "/"
+        if item != "/":
+            extra.append(item)
+    return ARCHIVE_PREFIXES + tuple(extra)
+
+
+def _is_archive(rel: str, manifest: dict[str, Any] | None = None) -> bool:
+    path = _norm(rel)
+    for prefix in _archive_prefixes(manifest):
+        base = prefix.rstrip("/")
+        if path == base or path.startswith(base + "/"):
+            return True
+    return False
+
+
+def _is_code(rel: str) -> bool:
+    rel = _norm(rel)
+    if not rel or rel.startswith((".agents/", "node_modules/", ".git/", "dist/", "coverage/", "vendor/")):
+        return False
+    if _is_archive(rel) or rel.startswith("docs/"):
+        return False
+    name = Path(rel).name
+    if name in _LOCK_NAMES or ".generated." in name:
+        return False
+    return not rel.endswith(_CODE_SKIP)
+
+
+def load_manifest(repo: Path) -> dict[str, Any]:
+    path = repo / "docs" / "llm" / "MANIFEST.yaml"
+    if not path.is_file():
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, Exception):  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _listed_live(manifest: dict[str, Any]) -> list[str]:
+    pack = manifest.get("pack") or {}
+    extra = manifest.get("live") or []
+    out: list[str] = []
+    for raw in list(pack.get("always_load") or []) + list(pack.get("on_demand") or []) + list(extra):
+        rel = _norm(str(raw))
+        if rel and not _is_archive(rel, manifest):
+            out.append(rel)
+    return out
+
+
+def live_doc_paths(repo: Path, manifest: dict[str, Any] | None = None) -> list[Path]:
+    manifest = manifest if manifest is not None else load_manifest(repo)
+    listed = _listed_live(manifest)
+    if not listed:
+        listed = [name for name in DEFAULT_LIVE if (repo / name).is_file()]
+        llm = repo / "docs" / "llm"
+        if llm.is_dir():
+            listed.extend(
+                str(p.relative_to(repo))
+                for p in sorted(llm.rglob("*"))
+                if p.is_file() and not _is_archive(str(p.relative_to(repo)), manifest)
+            )
+        for claude in sorted(repo.glob("apps/*/CLAUDE.md")):
+            listed.append(str(claude.relative_to(repo)))
+    for app_docs in sorted(repo.glob("apps/*/docs/**/*")):
+        if app_docs.is_file() and not _is_archive(str(app_docs.relative_to(repo)), manifest):
+            listed.append(str(app_docs.relative_to(repo)))
+    for pattern in LIVE_EXTRA_GLOBS:
+        for hit in sorted(repo.glob(pattern)):
+            if hit.is_file():
+                listed.append(str(hit.relative_to(repo)))
+    seen: set[str] = set()
+    paths: list[Path] = []
+    for rel in listed:
+        if rel in seen or _is_archive(rel, manifest):
+            continue
+        seen.add(rel)
+        path = repo / rel
+        if path.is_file():
+            paths.append(path)
+    return paths
+
+
+def load_web(repo: Path) -> dict[str, Any]:
+    path = repo / "docs" / "web.yaml"
+    if not path.is_file():
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def hub_pages_for_changes(repo: Path, code_changed: list[str]) -> list[str]:
+    web = load_web(repo)
+    nodes = {str(n.get("id")): n for n in (web.get("nodes") or []) if isinstance(n, dict)}
+    stale: list[str] = []
+    for edge in web.get("edges") or []:
+        if not isinstance(edge, dict) or str(edge.get("rel") or "") != "hub":
+            continue
+        src = nodes.get(str(edge.get("from") or ""))
+        dst = nodes.get(str(edge.get("to") or ""))
+        if not src or not dst:
+            continue
+        owns = [str(x).replace("/**", "").rstrip("/") for x in (src.get("owns") or [])]
+        if any(cites_change(set(owns), [p]) for p in code_changed):
+            page = str(dst.get("page") or "")
+            if page:
+                stale.append(page)
+    return stale
+
+
+def _walk_yaml_paths(obj: Any) -> list[str]:
+    found: list[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in YAML_PATH_KEYS:
+                found.extend(_as_path_values(value))
+            found.extend(_walk_yaml_paths(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(_walk_yaml_paths(item))
+    return found
+
+
+def _as_path_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        rel = _norm(value.split(":")[0])
+        return [rel] if rel and "/" in rel else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            out.extend(_as_path_values(item))
+        return out
+    return []
+
+
+def extract_cited(text: str) -> set[str]:
+    cited = {_norm(m.group(1)) for m in _FILE_TOKEN.finditer(text)}
+    return {p for p in cited if p and not _is_archive(p)}
+
+
+def _frontmatter(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    try:
+        import yaml
+
+        data = yaml.safe_load(text[3:end])
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def page_owns(path: Path) -> set[str]:
+    owns: set[str] = set()
+    for raw in _frontmatter(path).get("owns") or []:
+        item = _norm(str(raw).replace("/**", "").rstrip("/"))
+        if item and not _is_archive(item):
+            owns.add(item)
+    if is_app_claude(path):
+        owns.add(f"apps/{path.parent.name}")
+    return owns
+
+
+def is_app_claude(path: Path) -> bool:
+    parts = path.parts
+    return path.name == "CLAUDE.md" and len(parts) >= 3 and parts[-3] == "apps"
+
+
+def is_stub_page(path: Path) -> bool:
+    if str(_frontmatter(path).get("status") or "").strip().lower() == "stub":
+        return True
+    if not is_app_claude(path):
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    return "REPLACE_ME" in text or "## Never" not in text
+
+
+def page_body(text: str) -> str:
+    if "<!-- body:start -->" in text:
+        return text.split("<!-- body:start -->", 1)[1].split("<!-- body:end -->", 1)[0]
+    return text
+
+
+def page_kind(path: Path, meta: dict[str, Any] | None = None) -> str:
+    if is_app_claude(path):
+        return "claude"
+    name = path.name.lower()
+    rel = path.as_posix()
+    if "glossary" in name:
+        return "glossary"
+    if "gotcha" in name:
+        return "gotchas"
+    if "architecture" in name:
+        return "architecture"
+    if name == "runbook.md":
+        return "runbook"
+    if "data-model" in name:
+        return "data-model"
+    if "pattern" in name:
+        return "patterns"
+    kind = str((meta or {}).get("kind") or "").strip().lower()
+    if kind in {"hub", "unit", "surface", "process", "store", "feature"}:
+        return kind
+    if "/hubs/" in rel:
+        return "hub"
+    if "/features/" in rel:
+        return "feature"
+    if any(part in rel for part in ("/packages/", "/apps/", "/components/")):
+        return "unit"
+    return "other"
+
+
+def cite_line_problems(repo: Path, body: str, limit: int = 8) -> list[str]:
+    problems: list[str] = []
+    for match in _CITE_LINE.finditer(body):
+        rel = _norm(match.group(1))
+        line = int(match.group(2))
+        target = repo / rel
+        if not target.is_file():
+            problems.append(f"missing:{rel}:{line}")
+        else:
+            try:
+                with target.open(encoding="utf-8", errors="ignore") as handle:
+                    nlines = sum(1 for _ in handle)
+            except OSError:
+                continue
+            if line > nlines:
+                problems.append(f"oob:{rel}:{line}>{nlines}")
+        if len(problems) >= limit:
+            break
+    return problems
+
+
+def _skip_completeness(path: Path, meta: dict[str, Any]) -> bool:
+    if is_app_claude(path):
+        return False
+    if path.name in _SKIP_COMPLETENESS_NAMES or path.suffix in {".yaml", ".yml"}:
+        return True
+    if "llm" in path.parts:
+        return True
+    status = str(meta.get("status") or "").strip().lower()
+    # Token/spec files (DESIGN.md with colors:) have no wiki status — not a stub.
+    return status in {"", "deprecated"}
+
+
+def thin_reasons(path: Path, repo: Path | None = None) -> list[str]:
+    """Why an active wiki page is still a stub-quality fill. Empty = complete."""
+    meta = _frontmatter(path)
+    if _skip_completeness(path, meta):
+        return []
+    if str(meta.get("status") or "").strip().lower() == "stub":
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ["unreadable"]
+    body = page_body(text)
+    reasons: list[str] = []
+    if (
+        "_stub" in body
+        or "<!-- fill:" in body
+        or "REPLACE_ME" in body
+        or "One sentence: runtime role" in body
+    ):
+        reasons.append("stub_marker")
+        return reasons
+    kind = page_kind(path, meta)
+    floor = _KIND_FLOORS.get(kind) or _KIND_FLOORS["other"]
+    words = len(_WORD.findall(body))
+    cites = len(_CITE_LINE.findall(body))
+    h2 = len(_H2.findall(body))
+    bullets = sum(1 for line in body.splitlines() if line.lstrip().startswith("- "))
+    rows = sum(
+        1
+        for line in body.splitlines()
+        if line.startswith("|") and "---" not in line and "file:line" not in line.lower()
+    )
+    if floor.get("words") and words < int(floor["words"]):
+        reasons.append(f"words:{words}<{floor['words']}")
+    if floor.get("cites") and cites < int(floor["cites"]):
+        reasons.append(f"cites:{cites}<{floor['cites']}")
+    if floor.get("h2") and h2 < int(floor["h2"]):
+        reasons.append(f"h2:{h2}<{floor['h2']}")
+    if floor.get("bullets") and bullets < int(floor["bullets"]):
+        reasons.append(f"bullets:{bullets}<{floor['bullets']}")
+    if floor.get("rows") and rows < int(floor["rows"]):
+        reasons.append(f"rows:{rows}<{floor['rows']}")
+    if floor.get("mermaid") and "```mermaid" not in body:
+        reasons.append("mermaid")
+    for heading in floor.get("headings") or ():
+        if heading.lower() not in body.lower():
+            reasons.append(f"heading:{heading}")
+    if repo is not None:
+        problems = cite_line_problems(repo, body)
+        if problems:
+            reasons.append("cite_oob")
+    return reasons
+
+
+def _needs_fill(hit: dict[str, Any]) -> bool:
+    return bool(hit.get("stub") or hit.get("thin"))
+
+
+def _live_apps(repo: Path) -> list[Path]:
+    root = repo / "apps"
+    if not root.is_dir():
+        return []
+    out: list[Path] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if not ((child / "package.json").is_file() or (child / "pyproject.toml").is_file()):
+            continue
+        if any((child / name).exists() for name in ("src", "app", "lib", "cmd", "internal")):
+            out.append(child)
+    return out
+
+
+def passport_gaps(repo: Path) -> list[str]:
+    """Why docs enable must run project-onboard before wiki fill."""
+    repo = repo.resolve()
+    gaps: list[str] = []
+    root = repo / "CLAUDE.md"
+    if not root.is_file():
+        gaps.append("root-claude-missing")
+    else:
+        try:
+            head = root.read_text(encoding="utf-8")[:4000]
+        except OSError:
+            head = ""
+        if any(token in head for token in ("REPLACE_ME", "Edit me", "# Project\n")):
+            gaps.append("root-claude-stub")
+    apps = _live_apps(repo)
+    if apps and not (repo / "docs" / "llm" / "MODULE_MAP.yaml").is_file():
+        gaps.append("module-map-missing")
+    for app in apps:
+        claude = app / "CLAUDE.md"
+        rel = str(claude.relative_to(repo))
+        if not claude.is_file():
+            gaps.append(f"missing:{rel}")
+            continue
+        if is_stub_page(claude):
+            gaps.append(f"stub:{rel}")
+        else:
+            reasons = thin_reasons(claude, repo)
+            if reasons:
+                gaps.append(f"thin:{rel}")
+    return gaps
+
+
+def apply_page_cap(result: dict[str, Any], cap: int) -> dict[str, Any]:
+    stale = list(result.get("stale_docs") or [])
+    hits = {str(h.get("doc")): h for h in (result.get("hits") or []) if h.get("doc")}
+    stubs = [rel for rel in stale if _needs_fill(hits.get(rel) or {})]
+    rest = [rel for rel in stale if rel not in stubs]
+    ordered = stubs + rest
+    result["stale_docs"] = ordered
+    if cap <= 0 or len(ordered) <= cap:
+        result["deferred"] = []
+        return result
+    keep = ordered[:cap]
+    result["stale_docs"] = keep
+    result["deferred"] = ordered[cap:]
+    keep_set = set(keep)
+    result["hits"] = [hit for hit in result.get("hits") or [] if hit.get("doc") in keep_set]
+    return result
+
+
+def cited_in_file(path: Path) -> set[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    cited = extract_cited(text)
+    cited.update(page_owns(path))
+    if path.suffix in {".yaml", ".yml"}:
+        try:
+            import yaml
+
+            loaded = yaml.safe_load(text)
+        except (OSError, Exception):  # noqa: BLE001
+            loaded = None
+        cited.update(_norm(p) for p in _walk_yaml_paths(loaded) if p)
+    return {p for p in cited if p and not _is_archive(p)}
+
+
+def cites_change(cited: set[str], changed: list[str]) -> bool:
+    for rel in changed:
+        item = _norm(rel)
+        for src in cited:
+            src_n = _norm(src)
+            if not src_n:
+                continue
+            if item == src_n or item.startswith(src_n.rstrip("/") + "/"):
+                return True
+    return False
+
+
+def git_changed(repo: Path, since: str) -> list[str]:
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "log",
+            f"--since={since}",
+            "--name-only",
+            "--pretty=format:",
+            "--",
+            ".",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in result.stdout.splitlines():
+        rel = _norm(line)
+        if rel and rel not in seen:
+            seen.add(rel)
+            out.append(rel)
+    return out
+
+
+def resolve_since(manifest: dict[str, Any], since: str) -> str:
+    refresh = manifest.get("refresh") or {}
+    last = refresh.get("last_refresh") or refresh.get("last_full_onboard")
+    if isinstance(last, str) and last.strip():
+        return last.strip()
+    return since
+
+
+def scan_repo(
+    repo: Path, since: str = "24 hours ago", page_cap: int = 0
+) -> dict[str, Any]:
+    repo = repo.resolve()
+    manifest = load_manifest(repo)
+    window = resolve_since(manifest, since)
+    changed = git_changed(repo, window)
+    code_changed = [p for p in changed if _is_code(p)]
+    stale: list[str] = []
+    hits: list[dict[str, Any]] = []
+    for doc in live_doc_paths(repo, manifest):
+        rel = str(doc.relative_to(repo))
+        cited = cited_in_file(doc)
+        stub = is_stub_page(doc)
+        reasons = thin_reasons(doc, repo)
+        incomplete = stub or bool(reasons)
+        matched = [p for p in code_changed if cites_change(cited, [p])]
+        if not incomplete and (not cited or not matched):
+            continue
+        stale.append(rel)
+        hits.append(
+            {
+                "doc": rel,
+                "changed": matched[:20],
+                "stub": stub,
+                "thin": reasons,
+            }
+        )
+    for hub_page in hub_pages_for_changes(repo, code_changed):
+        if hub_page in stale:
+            continue
+        stale.append(hub_page)
+        hits.append({"doc": hub_page, "changed": code_changed[:8], "stub": False, "thin": []})
+    if not stale:
+        return {
+            "status": "skip",
+            "reason": "no cited live-pack paths changed",
+            "since": window,
+            "changed": code_changed,
+            "stale_docs": [],
+            "hits": [],
+            "deferred": [],
+        }
+    result = {
+        "status": "stale",
+        "reason": "cited live-pack paths changed or stub/thin",
+        "since": window,
+        "changed": code_changed,
+        "stale_docs": stale,
+        "hits": hits,
+        "deferred": [],
+    }
+    return apply_page_cap(result, page_cap)
+
+
+def write_daylog(repo: Path, result: dict[str, Any]) -> Path:
+    """Map today's committed files to the docs pages that should be patched."""
+    from datetime import datetime
+
+    day = datetime.now().date().isoformat()
+    art = repo / ".agents" / "session-log"
+    art.mkdir(parents=True, exist_ok=True)
+    path = art / f"DOCS-DAY-{day}.md"
+    changed = list(result.get("changed") or [])
+    hits = list(result.get("hits") or [])
+    deferred = list(result.get("deferred") or [])
+    lines = [
+        f"# DOCS day {day}",
+        "",
+        f"since: {result.get('since') or 'yesterday'}",
+        f"status: {result.get('status')}",
+        f"changed: {len(changed)}",
+        f"stale_docs: {len(result.get('stale_docs') or [])}",
+        f"deferred: {len(deferred)}",
+        "",
+        "## Changed code",
+        "",
+    ]
+    if changed:
+        lines.extend(f"- `{rel}`" for rel in changed)
+    else:
+        lines.append("- (none)")
+    lines.extend(["", "## Pages to edit", ""])
+    if hits:
+        lines.append("| page | why | changed |")
+        lines.append("|------|-----|---------|")
+        for hit in hits:
+            if hit.get("thin"):
+                why = "thin"
+            elif hit.get("stub"):
+                why = "stub"
+            else:
+                why = "owns/cite"
+            files = ", ".join(f"`{p}`" for p in (hit.get("changed") or [])[:8]) or "—"
+            lines.append(f"| `{hit.get('doc')}` | {why} | {files} |")
+    else:
+        lines.append("- (none)")
+    if deferred:
+        lines.extend(["", "## Deferred", ""])
+        lines.extend(f"- `{rel}`" for rel in deferred)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log = repo / "docs" / "log.md"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    if not log.is_file():
+        log.write_text("# Docs log\n\n<!-- generated; append-only -->\n", encoding="utf-8")
+    extra = (
+        f"changed: {', '.join(changed[:20]) or '(none)'}\n"
+        f"pages: {', '.join(result.get('stale_docs') or []) or '(none)'}\n"
+    )
+    block = f"\n## [{day}] day | {result.get('since') or 'yesterday'}\n{extra}"
+    existing = log.read_text(encoding="utf-8")
+    if f"## [{day}] day |" not in existing:
+        log.write_text(existing + block, encoding="utf-8")
+    return path
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Live-pack stale map (no LLM)")
+    parser.add_argument("repo", nargs="?", default=".", help="project root")
+    parser.add_argument("--since", default="24 hours ago")
+    parser.add_argument("--page-cap", type=int, default=0)
+    parser.add_argument("--write-daylog", action="store_true")
+    parser.add_argument(
+        "--passport-gaps",
+        action="store_true",
+        help="print passport gaps (app CLAUDE / MODULE_MAP); no stale scan",
+    )
+    args = parser.parse_args(argv)
+    repo = Path(args.repo).expanduser()
+    if not repo.is_dir():
+        print(json.dumps({"status": "error", "reason": f"not a dir: {repo}"}), flush=True)
+        return 1
+    if args.passport_gaps:
+        gaps = passport_gaps(repo)
+        print(json.dumps({"needed": bool(gaps), "gaps": gaps}, ensure_ascii=True), flush=True)
+        return 0 if gaps else 2
+    result = scan_repo(repo, args.since, page_cap=args.page_cap)
+    if args.write_daylog:
+        result["daylog"] = str(write_daylog(repo, result).relative_to(repo))
+    print(json.dumps(result, ensure_ascii=True), flush=True)
+    if result["status"] == "stale":
+        return 0
+    if result["status"] == "skip":
+        return 2
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

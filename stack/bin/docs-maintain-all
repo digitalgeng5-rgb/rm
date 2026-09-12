@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Scan common roots for Claude Lane Stack projects and maintain docs.
+set -euo pipefail
+# shellcheck disable=SC1091
+. "$(dirname "$0")/lane-cron-path.sh"
+
+SINCE="yesterday"
+DRY=""
+IF_HOUR=0
+for arg in "$@"; do
+  case "$arg" in
+    --if-hour) IF_HOUR=1 ;;
+    --dry-run) DRY="--dry-run" ;;
+    *) SINCE="$arg" ;;
+  esac
+done
+export DOCS_IF_HOUR="$IF_HOUR"
+ROOTS=(
+  "$HOME/apps"
+  "$HOME/sites"
+  "$HOME/tools"
+)
+
+is_lane_stack() {
+  local d="$1"
+  [[ -f "$d/CLAUDE.md" ]] && grep -q 'Claude Lane Stack' "$d/CLAUDE.md" && return 0
+  [[ -f "$d/.agents/routing.profile.yaml" ]] && return 0
+  [[ -d "$d/.agents/runs" ]] && return 0
+  return 1
+}
+
+found=0
+for root in "${ROOTS[@]}"; do
+  [[ -d "$root" ]] || continue
+  # depth 2: apps/foo, tools/foo
+  while IFS= read -r -d '' gitdir; do
+    proj=$(dirname "$gitdir")
+    if is_lane_stack "$proj"; then
+      found=$((found+1))
+      echo "==== $proj ===="
+      docs-maintain-project "$proj" "$SINCE" $DRY || echo "WARN: failed $proj"
+    fi
+  done < <(find "$root" -maxdepth 3 -type d -name .git -print0 2>/dev/null)
+done
+
+echo "Scanned Lane Stack projects touched: $found"
+echo "Cron: 0 * * * * \$HOME/.agents/bin/docs-maintain-all --if-hour >>\$HOME/.agents/logs/docs-maintain.log 2>&1"

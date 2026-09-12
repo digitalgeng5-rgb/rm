@@ -1,0 +1,25 @@
+id: strategy-evidence
+title: Evidence-based strategy & cocoons
+phase: strategy
+status: active
+version: "1.0.0"
+summary: "Cocoon 4.0 via X4; backlog from graph + evidence."
+depends_on: [passport-onboard, discovery-research]
+soft_depends_on: [intent-semantics, technical-seo]
+provides: [strategy.doc, strategy.cocoons, strategy.backlog]
+requires_provides: [passport.anamnesis]
+skills: [drmax-cocoon-engine-x4, seo-drmax-orchestrator]
+originals: []
+cli: []
+artifacts:
+  writes:
+    - ".agents/seo/<slug>/strategy/**"
+  reads:
+    - ".agents/seo/<slug>/discovery/**"
+    - ".agents/seo/<slug>/ANAMNESIS.md"
+env: []
+agent_triggers: ["стратегия", "кокон", "Q*", "NavBoost"]
+entrypoints:
+  agent: "X4 /кокон → strategy/cocoons/ + backlog.yaml"
+  cli: "seo-module scenario strategy-evidence qstar-navboost"
+scenarios: [qstar-navboost.yaml, cocoon-design.yaml, titan-os.yaml]

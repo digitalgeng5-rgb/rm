@@ -1,0 +1,5 @@
+claude-lane-stack
+upstream: https://github.com/VKirill/claude-lane-stack
+tag: v1.27.0
+commit: e01145e17558953bff2472d0776aa8ee5fa9f896
+vendored_at: 2026-09-12

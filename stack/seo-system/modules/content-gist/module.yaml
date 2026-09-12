@@ -1,0 +1,29 @@
+id: content-gist
+title: GIST content logic
+phase: content
+status: active
+version: "1.1.0"
+summary: "X4 GIST v4.3 — page jobs and drafts inside Cocoon Engine."
+depends_on: [intent-semantics]
+soft_depends_on: [site-scan, strategy-evidence]
+provides: [content.gist_plan, content.draft_structure]
+requires_provides: []
+skills: [drmax-cocoon-engine-x4]
+originals:
+  - "drmax-cocoon-engine-x4/originals/GIST Content Logic Skill-v-4-3.md"
+  - "drmax-cocoon-engine-x4/originals/CP-Navigator-v1-9.md"
+cli: [seo-prompt-log]
+artifacts:
+  writes:
+    - ".agents/seo/<slug>/content/pages/<page>/gist-plan.md"
+    - ".agents/seo/<slug>/content/pages/<page>/draft.md"
+    - ".agents/seo/<slug>/content/pages/<page>/meta.md"
+  reads:
+    - ".agents/seo/<slug>/scans/pages/**"
+    - ".agents/seo/<slug>/discovery/intent/**"
+env: []
+agent_triggers: ["GIST", "написать страницу", "переписать страницу"]
+entrypoints:
+  agent: "X4 /start then GIST 4.3 mode; open originals 1:1"
+  cli: "seo-module scenario content-gist creation"
+scenarios: [creation.yaml, audit.yaml, competitive.yaml, meta-step8.yaml]

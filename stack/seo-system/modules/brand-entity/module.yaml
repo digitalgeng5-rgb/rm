@@ -1,0 +1,28 @@
+id: brand-entity
+title: Brand entity & SERM
+phase: offpage
+status: active
+version: "1.0.0"
+summary: "BrandCore SSoT + market-scoped locale split."
+depends_on: [passport-onboard]
+soft_depends_on: [services-data]
+provides: [brand.entity, brand.serm]
+requires_provides: []
+skills: [drmax-brandcore, drmax-market-scoped]
+originals:
+  - "drmax-brandcore/ORIGINAL.md"
+  - "drmax-brandcore/NAVIGATOR.md"
+  - "drmax-market-scoped/ORIGINAL.md"
+cli: []
+artifacts:
+  writes:
+    - ".agents/seo/<slug>/passport/BRANDCORE.md"
+    - ".agents/seo/<slug>/offpage/locales/**"
+  reads:
+    - ".agents/seo/<slug>/ANAMNESIS.md"
+env: []
+agent_triggers: ["entity", "SERM", "бренд в LLM", "негатив бренд"]
+entrypoints:
+  agent: "BrandCore fill; Market-Scoped if 2+ locales"
+  cli: "seo-module scenario brand-entity footprint"
+scenarios: [footprint.yaml, poisoning.yaml, locales.yaml]

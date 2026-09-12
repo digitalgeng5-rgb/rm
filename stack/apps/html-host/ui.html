@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f0f1a">
+  <title>HTML share online: 24-hour link, same URL when you edit</title>
+  <meta name="description" content="Publish HTML, CSS, and JS without Git. Updates keep the same URL. The page is gone after 24 hours — no account.">
+  <link rel="canonical" href="https://htmlshare.pro/">
+  <meta property="og:title" content="HTML share online: 24-hour link, same URL when you edit">
+  <meta property="og:description" content="Publish HTML, CSS, and JS without Git. Updates keep the same URL. Gone after 24 hours.">
+  <meta property="og:url" content="https://htmlshare.pro/">
+  <meta property="og:type" content="website">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"WebApplication","name":"HTML Share","url":"https://htmlshare.pro/","applicationCategory":"DeveloperApplication","operatingSystem":"Web","description":"Paste HTML, CSS, and JS and publish a 24-hour share link. Updates reuse the same URL.","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
+  <style>
+    :root {
+      --bg: #0f0f1a;
+      --panel: #1a1a2e;
+      --line: #2a2a40;
+      --ink: #e8e8f0;
+      --mute: #8888aa;
+      --green: #04AA6D;
+      --green-dim: #037a4e;
+      --nav: #12121f;
+    }
+    body.light {
+      --bg: #f4f4f8;
+      --panel: #fff;
+      --line: #d8d8e4;
+      --ink: #1a1a2e;
+      --mute: #6a6a88;
+      --nav: #ececf4;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.4 Inter, system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      overflow: auto;
+    }
+    .hero { padding: 14px 16px 4px; }
+    .hero h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.02em; }
+    .hero p { margin: 0 0 10px; color: var(--mute); max-width: 46rem; }
+    .seo { padding: 20px 16px 40px; border-top: 1px solid var(--line); max-width: 46rem; }
+    .seo h2 { font-size: 16px; margin: 22px 0 8px; }
+    .seo h3 { font-size: 14px; margin: 16px 0 6px; }
+    .seo p { color: var(--mute); margin: 0 0 8px; }
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 10px 16px;
+      background: var(--nav);
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+    }
+    .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; color: inherit; text-decoration: none; }
+    .brand svg { display: block; }
+    .div { width: 1px; height: 22px; background: var(--line); }
+    .toggles { display: flex; gap: 14px; flex-wrap: wrap; }
+    .tog { display: flex; align-items: center; gap: 8px; color: var(--mute); font-size: 12px; }
+    .sw { position: relative; width: 36px; height: 20px; }
+    .sw input { opacity: 0; width: 0; height: 0; }
+    .sw i {
+      position: absolute; inset: 0; background: #2a2a40; border-radius: 20px; cursor: pointer;
+    }
+    .sw i::after {
+      content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px;
+      background: #fff; border-radius: 50%; transition: 160ms;
+    }
+    .sw input:checked + i { background: var(--green); }
+    .sw input:checked + i::after { transform: translateX(16px); }
+    .acts { display: flex; gap: 8px; margin-left: auto; }
+    button {
+      font: 500 13px/1 Inter, system-ui, sans-serif;
+      border: 0; border-radius: 8px; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 12px;
+    }
+    .run { background: var(--green); color: #fff; }
+    .run:hover { background: var(--green-dim); }
+    .ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+    .ghost:hover { border-color: var(--green); }
+    .hint { font: 11px/1 JetBrains Mono, ui-monospace, monospace; opacity: .65; }
+    .work { flex: 1; display: flex; min-height: 62vh; --ed: 50%; }
+    .work.stack { flex-direction: column; }
+    .col { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+    .editor { flex: 0 0 var(--ed); }
+    #preview { flex: 1 1 auto; }
+    .gutter {
+      flex: 0 0 6px; background: var(--line); cursor: col-resize;
+    }
+    .work.stack .gutter { cursor: row-resize; }
+    select {
+      background: var(--panel); color: var(--ink);
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 6px 8px; font: 12px Inter, system-ui, sans-serif;
+    }
+    .split .editor { display: grid; grid-template-rows: 1fr 1fr 1fr; }
+    .tabs { display: flex; background: var(--panel); border-bottom: 1px solid var(--line); }
+    .split .tabs { display: none; }
+    .tab {
+      background: none; color: var(--mute); border-radius: 0;
+      border-bottom: 2px solid transparent; padding: 10px 14px;
+    }
+    .tab.on { color: var(--ink); border-bottom-color: var(--green); }
+    .panel { display: none; flex: 1; min-height: 0; flex-direction: column; }
+    .panel.on, .split .panel { display: flex; }
+    .ph {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line);
+      font-size: 12px; color: var(--mute);
+    }
+    .badge { color: var(--green); font-weight: 600; margin-right: 8px; }
+    .panel .CodeMirror {
+      flex: 1; height: auto; min-height: 0;
+      background: var(--bg); color: var(--ink);
+      font-family: "JetBrains Mono", ui-monospace, monospace;
+      font-size: 13px; line-height: 1.5;
+    }
+    .CodeMirror-gutters { background: var(--panel); border-right: 1px solid var(--line); color: var(--mute); }
+    .CodeMirror-linenumber { color: var(--mute); }
+    .CodeMirror-cursor { border-left: 2px solid var(--ink); }
+    .CodeMirror-selected { background: #2a3a5a; }
+    body.light .CodeMirror-selected { background: #c8d4f0; }
+    .cm-header, .cm-tag { color: var(--green); }
+    .cm-attribute { color: #82aaff; }
+    .cm-string, .cm-string-2 { color: #e6c07b; }
+    .cm-comment { color: var(--mute); }
+    .cm-keyword { color: #c792ea; }
+    .cm-number, .cm-atom { color: #f78c6c; }
+    .cm-property, .cm-def { color: #61afef; }
+    .cm-variable, .cm-variable-2 { color: var(--ink); }
+    .cm-operator { color: #56b6c2; }
+    .cm-meta, .cm-qualifier { color: #e6c07b; }
+    .cm-builtin, .cm-type { color: #e06c75; }
+    .stage {
+      flex: 1; min-height: 0; display: flex; justify-content: center;
+      background: #0a0a12;
+    }
+    .frame {
+      position: relative; height: 100%; width: 100%; max-width: 100%;
+      background: #fff;
+    }
+    .stage[data-vp="tablet"] .frame { width: 768px; }
+    .stage[data-vp="mobile"] .frame { width: 390px; }
+    .frame iframe {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      border: 0; background: #fff;
+    }
+    .frame iframe.is-back { visibility: hidden; pointer-events: none; }
+    .status {
+      display: flex; justify-content: space-between; padding: 6px 14px;
+      border-top: 1px solid var(--line); color: var(--mute); font-size: 12px;
+    }
+    .status a { color: var(--green); }
+    .toast {
+      position: fixed; right: 16px; bottom: 16px; background: var(--panel);
+      border: 1px solid var(--line); padding: 10px 14px; border-radius: 8px;
+      display: none; max-width: 28rem;
+    }
+    .toast.on { display: block; }
+  </style>
+</head>
+<body>
+  <nav class="nav">
+    <a class="brand" href="/" aria-label="HTML Share">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M8 6L3 12L8 18" stroke="#04AA6D" stroke-width="2.2" stroke-linecap="round"/>
+        <path d="M16 6L21 12L16 18" stroke="#04AA6D" stroke-width="2.2" stroke-linecap="round"/>
+        <path d="M14 4L10 20" stroke="#04AA6D" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      HTML Share
+    </a>
+    <div class="div"></div>
+    <div class="toggles">
+      <label class="tog">Live Preview <span class="sw"><input type="checkbox" id="live" checked><i></i></span></label>
+      <label class="tog">Split Editor <span class="sw"><input type="checkbox" id="split"><i></i></span></label>
+      <label class="tog">Stack <span class="sw"><input type="checkbox" id="stack"><i></i></span></label>
+      <label class="tog">Light <span class="sw"><input type="checkbox" id="theme"><i></i></span></label>
+      <label class="tog">Viewport
+        <select id="vp" aria-label="Preview width">
+          <option value="pc">Desktop</option>
+          <option value="tablet">Tablet</option>
+          <option value="mobile">Phone</option>
+        </select>
+      </label>
+    </div>
+    <div class="acts">
+      <button class="run" id="run" type="button">▶ Run <span class="hint">Alt+R</span></button>
+      <button class="ghost" id="save" type="button">Save <span class="hint">Alt+S</span></button>
+      <button class="ghost" id="clr" type="button">Clear <span class="hint">Alt+C</span></button>
+      <button class="ghost" id="pub" type="button">Publish 24h</button>
+    </div>
+  </nav>
+  <header class="hero">
+    <h1>HTML share online</h1>
+    <p>Paste HTML, CSS, and JS. Publish. Send a live HTTPS link. Edits keep the same URL. The page expires in 24 hours. No Git, no account.</p>
+  </header>
+
+  <div class="work" id="work">
+    <div class="col editor" id="editor">
+      <div class="tabs" id="tabs">
+        <button type="button" class="tab on" data-tab="html">HTML</button>
+        <button type="button" class="tab" data-tab="css">CSS</button>
+        <button type="button" class="tab" data-tab="js">JS</button>
+      </div>
+      <div class="panel on" data-panel="html">
+        <div class="ph"><span><span class="badge">HTML</span>index.html</span></div>
+        <textarea id="html" spellcheck="false">&lt;!DOCTYPE html&gt;
+&lt;html lang="en"&gt;
+&lt;head&gt;
+  &lt;meta charset="utf-8"&gt;
+  &lt;title&gt;Preview&lt;/title&gt;
+  &lt;link rel="stylesheet" href="style.css"&gt;
+&lt;/head&gt;
+&lt;body&gt;
+  &lt;h1&gt;HTML share online&lt;/h1&gt;
+  &lt;p&gt;Publish to get a 24-hour link. Updates keep the same URL.&lt;/p&gt;
+  &lt;script src="script.js"&gt;&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;</textarea>
+      </div>
+      <div class="panel" data-panel="css">
+        <div class="ph"><span><span class="badge">CSS</span>style.css</span></div>
+        <textarea id="css" spellcheck="false">body {
+  background: #0f0f1a;
+  color: #e8e8f0;
+  font-family: Inter, system-ui, sans-serif;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px 20px;
+}
+h1 { color: #04AA6D; margin-bottom: 8px; }
+p { color: #8888aa; }</textarea>
+      </div>
+      <div class="panel" data-panel="js">
+        <div class="ph"><span><span class="badge">JS</span>script.js</span></div>
+        <textarea id="js" spellcheck="false">console.log("preview");</textarea>
+      </div>
+    </div>
+    <div class="gutter" id="gutter" role="separator" aria-orientation="vertical"></div>
+    <div class="col" id="preview">
+      <div class="ph"><span><span class="badge">PREVIEW</span><span id="vp-label">Desktop</span></span></div>
+      <div class="stage" id="stage" data-vp="pc">
+        <div class="frame">
+          <iframe id="view" title="Preview" sandbox="allow-scripts"></iframe>
+          <iframe id="view2" title="Preview" sandbox="allow-scripts" class="is-back"></iframe>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="status">
+    <span>Alt+R Run · Alt+S Save · Alt+C Clear · Tab Indent · Shift+Tab Outdent</span>
+    <span id="out"></span>
+  </div>
+  <footer class="seo">
+    <h2>Publish HTML online without a host</h2>
+    <p>This page is the only URL that should rank. You paste code here, hit Publish 24h, and send <code>/p/…/</code>. Shared pages are noindex and die after 24 hours — they are not a content silo.</p>
+    <h2>Same link when you update</h2>
+    <p>Publish again from the same editor session and the host overwrites that id. You do not mint a new URL for every save. That is the difference versus most “drop a file, get a new slug” tools.</p>
+    <h2>HTML, CSS, and JS together</h2>
+    <p>A full document can live in the HTML pane alone. If you split <code>style.css</code> and <code>script.js</code>, the host serves them as sibling files. Demo starter CSS is not attached to a pasted complete page.</p>
+    <h2>FAQ</h2>
+    <h3>How do I share HTML online?</h3>
+    <p>Paste the markup, click Publish 24h, copy the HTTPS link. Recipients open a rendered page. Opening <code>/p/{id}/</code> yourself loads the editor so you can keep editing.</p>
+    <h3>How is this different from GitHub Pages?</h3>
+    <p>No repository, no build, no custom domain on the share link. The tradeoff is explicit: 24 hours, then the files are gone.</p>
+    <h3>Can I publish only HTML?</h3>
+    <p>Yes. CSS and JS panes are optional. A complete <code>&lt;!DOCTYPE html&gt;</code> document is enough.</p>
+  </footer>
+  <div class="toast" id="toast"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/xml/xml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/css/css.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/htmlmixed/htmlmixed.min.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let front = $("view"), back = $("view2"), gen = 0, liveT = 0;
+    let lastH = "", lastJ = "";
+    let pageId = (location.pathname.match(/^\/p\/([A-Za-z0-9_-]{6,16})\/?$/) || [])[1] || "";
+    const cmOpt = {
+      lineNumbers: true, indentUnit: 2, tabSize: 2,
+      extraKeys: { Tab: "indentMore", "Shift-Tab": "indentLess" },
+    };
+    const edHtml = CodeMirror.fromTextArea($("html"), Object.assign({}, cmOpt, { mode: "htmlmixed" }));
+    const edCss = CodeMirror.fromTextArea($("css"), Object.assign({}, cmOpt, { mode: "css" }));
+    const edJs = CodeMirror.fromTextArea($("js"), Object.assign({}, cmOpt, { mode: "javascript" }));
+    const eds = [edHtml, edCss, edJs];
+    const html = { get value() { return edHtml.getValue(); }, set value(v) { edHtml.setValue(v); } };
+    const css = { get value() { return edCss.getValue(); }, set value(v) { edCss.setValue(v); } };
+    const js = { get value() { return edJs.getValue(); }, set value(v) { edJs.setValue(v); } };
+
+    function isStarterCss(s) {
+      return s.includes("#0f0f1a") && s.includes("#04AA6D") && s.includes("align-items: center");
+    }
+    function isFullHtml(s) {
+      return /<!DOCTYPE html/i.test(s) && /<\/html>/i.test(s);
+    }
+    function isStarterHtml(s) {
+      return s.includes("Publish to get a 24-hour link") || s.includes("Run — превью");
+    }
+    function isStarterJs(s) {
+      return s.trim() === 'console.log("preview");';
+    }
+    function dropDemoPanes() {
+      if (isStarterCss(css.value)) css.value = "";
+      if (isStarterJs(js.value)) js.value = "";
+    }
+    function doc() {
+      const h = html.value;
+      const skipDemo = isFullHtml(html.value) && isStarterCss(css.value) && !isStarterHtml(html.value);
+      const c = skipDemo ? "" : css.value;
+      const j = skipDemo ? "" : js.value;
+      let extra = "";
+      if (c.trim()) extra += `<style id="live-css">${c}</style>`;
+      if (j.trim()) extra += `<script>${j}<\/script>`;
+      if (!extra) return h;
+      if (/<\/body>/i.test(h)) return h.replace(/<\/body>/i, extra + "</body>");
+      return h + extra;
+    }
+    function paintCss() {
+      const idoc = front.contentDocument;
+      const st = idoc && idoc.getElementById("live-css");
+      if (!st) return false;
+      st.textContent = css.value;
+      return true;
+    }
+    function run() {
+      clearTimeout(liveT);
+      const htmlStr = doc();
+      lastH = html.value;
+      lastJ = js.value;
+      const n = ++gen;
+      back.onload = () => {
+        if (n !== gen) return;
+        front.classList.add("is-back");
+        back.classList.remove("is-back");
+        const t = front;
+        front = back;
+        back = t;
+      };
+      back.srcdoc = htmlStr;
+    }
+    function liveSoon() {
+      if (!$("live").checked) return;
+      if (html.value === lastH && js.value === lastJ && paintCss()) return;
+      clearTimeout(liveT);
+      liveT = setTimeout(run, 240);
+    }
+    function toast(t) {
+      const el = $("toast");
+      el.textContent = t;
+      el.classList.add("on");
+      setTimeout(() => el.classList.remove("on"), 4000);
+    }
+    function save() {
+      const blob = new Blob([doc()], { type: "text/html;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "index.html";
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast("Downloaded index.html");
+    }
+    function clearAll() {
+      html.value = "";
+      css.value = "";
+      js.value = "";
+      run();
+    }
+    $("run").onclick = run;
+    $("save").onclick = save;
+    $("clr").onclick = clearAll;
+    $("live").onchange = () => { if ($("live").checked) run(); };
+    eds.forEach((ed) => ed.on("change", liveSoon));
+    edHtml.on("change", (_cm, ch) => {
+      if (ch.origin !== "paste" || !isFullHtml(html.value) || isStarterHtml(html.value) || !isStarterCss(css.value)) return;
+      css.value = "";
+      js.value = "";
+      setSplit(false);
+    });
+    function refreshEds() { requestAnimationFrame(() => eds.forEach((ed) => ed.refresh())); }
+    document.querySelectorAll(".tab").forEach((btn) => {
+      btn.onclick = () => {
+        document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b === btn));
+        document.querySelectorAll(".panel").forEach((p) => {
+          p.classList.toggle("on", p.dataset.panel === btn.dataset.tab);
+        });
+        refreshEds();
+      };
+    });
+    function setSplit(on) {
+      $("split").checked = on;
+      $("editor").classList.toggle("split", on);
+      refreshEds();
+    }
+    $("split").onchange = () => setSplit($("split").checked);
+    $("stack").onchange = () => {
+      $("work").classList.toggle("stack", $("stack").checked);
+      $("gutter").setAttribute("aria-orientation", $("stack").checked ? "horizontal" : "vertical");
+      refreshEds();
+    };
+    $("theme").onchange = () => document.body.classList.toggle("light", $("theme").checked);
+    const vpNames = { pc: "Desktop", tablet: "Tablet", mobile: "Phone" };
+    $("vp").onchange = () => {
+      $("stage").dataset.vp = $("vp").value;
+      $("vp-label").textContent = vpNames[$("vp").value] || "Desktop";
+    };
+    $("gutter").addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      const work = $("work");
+      const rect = work.getBoundingClientRect();
+      const stack = work.classList.contains("stack");
+      function move(ev) {
+        const p = stack ? (ev.clientY - rect.top) / rect.height : (ev.clientX - rect.left) / rect.width;
+        work.style.setProperty("--ed", (Math.min(0.8, Math.max(0.2, p)) * 100) + "%");
+        refreshEds();
+      }
+      function up() {
+        removeEventListener("pointermove", move);
+        removeEventListener("pointerup", up);
+      }
+      addEventListener("pointermove", move);
+      addEventListener("pointerup", up);
+    });
+    document.addEventListener("keydown", (e) => {
+      if (!e.altKey) return;
+      if (e.code === "KeyR") { e.preventDefault(); run(); }
+      if (e.code === "KeyS") { e.preventDefault(); save(); }
+      if (e.code === "KeyC") { e.preventDefault(); clearAll(); }
+    });
+    $("pub").onclick = async () => {
+      dropDemoPanes();
+      const files = { "index.html": html.value };
+      if (css.value.trim()) files["style.css"] = css.value;
+      if (js.value.trim()) files["script.js"] = js.value;
+      const payload = { files };
+      if (pageId) payload.id = pageId;
+      $("pub").disabled = true;
+      try {
+        let r = await fetch("/api/pages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (r.status === 404 && pageId) {
+          delete payload.id;
+          r = await fetch("/api/pages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+        }
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || r.status);
+        pageId = j.id;
+        history.replaceState({}, "", `/p/${j.id}/`);
+        $("out").innerHTML = `<a href="${j.url}">${j.url}</a> · 24ч`;
+        toast(j.updated ? "Updated the same URL" : "Published for 24 hours");
+      } catch (err) {
+        toast(String(err.message || err));
+      } finally {
+        $("pub").disabled = false;
+      }
+    };
+    async function loadPage() {
+      if (!pageId) { run(); refreshEds(); return; }
+      const base = `/p/${pageId}/`;
+      const h = await fetch(base + "index.html");
+      if (!h.ok) { toast("Page not found or expired"); return; }
+      html.value = await h.text();
+      const c = await fetch(base + "style.css");
+      css.value = c.ok ? await c.text() : "";
+      const j = await fetch(base + "script.js");
+      js.value = j.ok ? await j.text() : "";
+      dropDemoPanes();
+      if (css.value.trim() || js.value.trim()) setSplit(true);
+      $("out").innerHTML = `<a href="${location.href}">${location.href}</a>`;
+      run();
+      refreshEds();
+    }
+    addEventListener("resize", refreshEds);
+    loadPage();
+  </script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+id: discovery-research
+title: Audience and demand research
+phase: discovery
+status: active
+version: "1.1.0"
+summary: "X4 Reddit Mapper Total for demand/voice; not the 25-prompt book chain."
+depends_on: [passport-onboard]
+soft_depends_on: [services-data, intent-semantics]
+provides: [discovery.niche, discovery.demand, discovery.audience, discovery.competitors]
+requires_provides: [passport.anamnesis]
+skills: [drmax-cocoon-engine-x4]
+originals:
+  - "drmax-cocoon-engine-x4/originals/Reddit-Mapper-Total-v-2-2.md"
+  - "drmax-cocoon-engine-x4/originals/CP-Navigator-v1-9.md"
+cli: [seo-prompt-log]
+artifacts:
+  writes:
+    - ".agents/seo/<slug>/discovery/**"
+  reads:
+    - ".agents/seo/<slug>/ANAMNESIS.md"
+env: [MUTAGEN_API_KEY, XMLSTOCK_*, DATAFORSEO_*]
+agent_triggers: ["исследование ниши", "discovery", "спрос", "аудитория"]
+entrypoints:
+  agent: "X4 /исследование or Mapper Total; open originals 1:1"
+  cli: "seo-module scenario discovery-research niche-entry"
+scenarios: [niche-entry.yaml, new-project.yaml, growth-existing.yaml, competitors-block2.yaml]

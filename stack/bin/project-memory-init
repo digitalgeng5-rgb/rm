@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="${1:-.}"
+ROOT="$(cd "$ROOT" && pwd)"
+TPL="${HOME}/.agents/templates"
+install_if_missing() {
+  local dest="$1" src="$2"
+  if [[ -e "$dest" ]]; then echo "skip exists: $dest"; return; fi
+  mkdir -p "$(dirname "$dest")"
+  cp "$src" "$dest"
+  echo "created: $dest"
+}
+# Canonical living memory under .agents/ (survive root cleanups).
+# Migrate legacy root copies once if present.
+migrate_living() {
+  local name="$1"
+  local pref="$ROOT/.agents/$name"
+  local leg="$ROOT/$name"
+  mkdir -p "$ROOT/.agents"
+  if [[ -f "$pref" ]]; then
+    return 0
+  fi
+  if [[ -f "$leg" ]]; then
+    mv "$leg" "$pref"
+    echo "migrated: $leg -> $pref"
+    return 0
+  fi
+  install_if_missing "$pref" "$TPL/$name"
+}
+migrate_living "PROGRESS.md"
+migrate_living "LESSONS.md"
+install_if_missing "$ROOT/docs/decisions.md" "$TPL/decisions.md"
+install_if_missing "$ROOT/.agents/agent-notes/OPEN.md" "$TPL/agent-notes-OPEN.md"
+mkdir -p "$ROOT/.agents/session-log" "$ROOT/.agents/todos" "$ROOT/.agents/runs"
+install_if_missing "$ROOT/.agents/session-log/README.md" "$TPL/session-log-README.md"
+if [[ ! -f "$ROOT/.agents/session-log/INDEX.md" ]]; then
+  printf '%s\n' '# Session log (agent handoff index)' '' '_No sessions yet._' > "$ROOT/.agents/session-log/INDEX.md"
+  echo "created: $ROOT/.agents/session-log/INDEX.md"
+fi
+for f in AGENTS.md CLAUDE.md; do
+  path="$ROOT/$f"
+  [[ -f "$path" ]] || continue
+  if ! grep -q 'PROGRESS.md\|project-memory' "$path" 2>/dev/null; then
+    cat >> "$path" << 'EOP'
+
+## Project memory (agents)
+
+On session start: read `.agents/PROGRESS.md` (if present), skim `.agents/LESSONS.md`.  
+On task done: update PROGRESS / LESSONS / `docs/decisions.md` per skill `project-memory`.  
+Auto handoff: `.agents/session-log/` (hooks). Ideas: `.agents/todos/`.
+EOP
+    echo "appended memory pointer: $path"
+  fi
+done
+echo "project-memory-init done: $ROOT"

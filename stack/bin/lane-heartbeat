@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Write heartbeat data; STATUS.md is a generated run-board view."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo", required=True, help="repo root or worktree (finds .agents upward)")
+    ap.add_argument("--run", required=True, help="run slug")
+    ap.add_argument("--task", required=True, help="task id e.g. 001")
+    ap.add_argument(
+        "--status",
+        default="running",
+        choices=["running", "done", "blocked", "stalled", "review", "partial"],
+    )
+    ap.add_argument("--note", default="")
+    args = ap.parse_args()
+    for label, value in (("run slug", args.run), ("task id", args.task)):
+        if not SAFE_NAME.fullmatch(value) or value in {".", ".."}:
+            ap.error(f"invalid {label}: {value!r}")
+
+    start = Path(args.repo).resolve()
+    root = start
+    agents = None
+    for p in [start, *start.parents]:
+        if (p / ".agents" / "runs").is_dir() or (p / ".git").exists():
+            # prefer path that has .agents/runs
+            if (p / ".agents").is_dir():
+                agents = p / ".agents"
+                root = p
+                break
+    if agents is None:
+        # worktree: look for .agents in start
+        agents = start / ".agents"
+        agents.mkdir(parents=True, exist_ok=True)
+        root = start
+
+    task_id = args.task
+    artifacts_root = (agents / "runs" / args.run / "artifacts").resolve(strict=False)
+    art = (artifacts_root / task_id).resolve(strict=False)
+    if artifacts_root not in art.parents:
+        ap.error("heartbeat artifact path escapes the run")
+    art.mkdir(parents=True, exist_ok=True)
+    hb = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "status": args.status,
+        "note": args.note,
+        "run": args.run,
+        "task": task_id,
+        "cwd": str(start),
+        "repo": str(root),
+    }
+    path = art / "heartbeat.json"
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(hb, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

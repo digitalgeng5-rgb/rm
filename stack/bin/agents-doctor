@@ -1,0 +1,1428 @@
+#!/usr/bin/env python3
+"""Detect Claude + optional write/review CLIs; write routing profile.
+
+PM is always Claude. Qwen, AGY, and Grok are switchable write providers.
+Review/onboard/docs may use Codex. Claude-only fallback if neither present.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROFILES = {
+    "full": {
+        "fast_write": "kimi",
+        "main_write": "kimi",
+        "review": "codex",
+        "emergency_write": "codex",
+    },
+    "claude-qwen": {
+        "fast_write": "qwen",
+        "main_write": "qwen",
+        "review": "claude-reviewer",
+        "emergency_write": "qwen",
+    },
+    "claude-kimi": {
+        "fast_write": "kimi",
+        "main_write": "kimi",
+        "review": "claude-reviewer",
+        "emergency_write": "kimi",
+    },
+    "claude-agy": {
+        "fast_write": "agy",
+        "main_write": "agy",
+        "review": "claude-reviewer",
+        "emergency_write": "agy",
+    },
+    "claude-codex": {
+        "fast_write": "codex",
+        "main_write": "codex",
+        "review": "codex",
+        "emergency_write": "codex",
+    },
+    "claude-grok": {
+        "fast_write": "grok",
+        "main_write": "grok",
+        "review": "claude-reviewer",
+        "emergency_write": "grok",
+    },
+    "claude-cursor": {
+        "fast_write": "cursor",
+        "main_write": "cursor",
+        "review": "claude-reviewer",
+        "emergency_write": "cursor",
+    },
+    "claude-opencode": {
+        "fast_write": "opencode",
+        "main_write": "opencode",
+        "review": "claude-reviewer",
+        "emergency_write": "opencode",
+    },
+    "claude-grok-codex": {
+        "fast_write": "grok",
+        "main_write": "grok",
+        "review": "codex",
+        "emergency_write": "codex",
+    },
+    "claude-only": {
+        "fast_write": "claude-worker",
+        "main_write": "claude-worker",
+        "review": "claude-reviewer",
+        "emergency_write": "claude-worker",
+    },
+}
+
+# Claude Agent role names (function), not brand of the durable process.
+# Daytime write process provider → always watched by run-supervisor.
+AGENT_MAP = {
+    "agy": "run-supervisor",
+    "grok": "run-supervisor",
+    "qwen": "run-supervisor",
+    "kimi": "run-supervisor",
+    # Durable daytime writer when main_write=codex (luna+max via lane-ctl).
+    "codex": "run-supervisor",
+    "cursor": "run-supervisor",
+    "opencode": "run-supervisor",
+    "claude-worker": "general-purpose",
+    "claude-reviewer": "night-reviewer",
+}
+
+
+def which(cmd: str) -> str | None:
+    return shutil.which(cmd)
+
+
+def run_version(cmd: list[str], timeout: float = 8.0) -> str:
+    try:
+        out = subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout
+        )
+        return (out or "").strip().splitlines()[0][:120]
+    except Exception as e:
+        return f"error: {e.__class__.__name__}"
+
+
+def command_lines(cmd: list[str], timeout: float = 8.0) -> list[str]:
+    try:
+        return subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout
+        ).splitlines()
+    except Exception:
+        return []
+
+
+AGY_READY_MODELS = (
+    "gemini-3.8-flash-high",
+    "gemini-3.7-flash-high",
+    "gemini-3.6-flash-high",
+)
+
+
+def agy_model_ids(lines: list[str]) -> set[str]:
+    """First token of each `agy models` line (`id<tab>label`)."""
+    ids: set[str] = set()
+    for line in lines:
+        token = line.strip().split()[0] if line.strip() else ""
+        if token:
+            ids.add(token)
+    return ids
+
+
+def bubblewrap_operational(binary: str | None) -> bool:
+    if not binary:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                binary,
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--unshare-pid",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/tmp",
+                "--",
+                "/bin/true",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def resolver_mount_args() -> list[str]:
+    try:
+        resolver_target = Path("/etc/resolv.conf").resolve(strict=True)
+    except OSError:
+        return []
+    runtime_root = Path("/run")
+    if not resolver_target.is_file() or not resolver_target.is_relative_to(
+        runtime_root
+    ):
+        return []
+
+    mounts: list[str] = []
+    parent = runtime_root
+    for part in resolver_target.parent.relative_to(runtime_root).parts:
+        parent /= part
+        mounts.extend(("--dir", str(parent)))
+    mounts.extend(("--ro-bind", str(resolver_target), str(resolver_target)))
+    return mounts
+
+
+def bubblewrap_resolver_operational(binary: str | None) -> bool:
+    if not binary:
+        return False
+    command = [
+        binary,
+        "--die-with-parent",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/run",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/var/tmp",
+    ]
+    command.extend(resolver_mount_args())
+    command.extend(
+        (
+            "--",
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "p=Path('/etc/resolv.conf').resolve(strict=True); "
+                "lines=p.read_text(encoding='utf-8').splitlines(); "
+                "raise SystemExit(0 if any(line.strip().startswith('nameserver ') "
+                "for line in lines) else 1)"
+            ),
+        )
+    )
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def detect() -> dict:
+    tools = {}
+    p = which("claude")
+    tools["claude"] = {
+        "present": bool(p),
+        "path": p,
+        "version": run_version(["claude", "--version"]) if p else None,
+        "required": True,
+    }
+    bwrap = which("bwrap")
+    bwrap_ready = bubblewrap_operational(bwrap)
+    resolver_ready = bubblewrap_resolver_operational(bwrap) if bwrap_ready else False
+    p = which("agy")
+    agy_models = command_lines(["agy", "models"]) if p else []
+    agy_agents = command_lines(["agy", "agents"]) if p else []
+    agy_model_ready = bool(agy_model_ids(agy_models) & set(AGY_READY_MODELS))
+    agy_agent_ready = any(line.strip() == "agy-writer" for line in agy_agents)
+    tools["agy"] = {
+        "present": bool(
+            p
+            and agy_model_ready
+            and agy_agent_ready
+            and bwrap_ready
+            and resolver_ready
+        ),
+        "binary_present": bool(p),
+        "model_present": agy_model_ready,
+        "agent_present": agy_agent_ready,
+        "path": p,
+        "version": run_version(["agy", "--version"]) if p else None,
+        "required": False,
+        "unavailable_reason": (
+            "gemini-3.8-flash-high unavailable"
+            if p and not agy_model_ready
+            else "agy-writer agent unavailable"
+            if p and not agy_agent_ready
+            else "bubblewrap missing"
+            if p and not bwrap
+            else "bubblewrap probe failed"
+            if p and not bwrap_ready
+            else "bubblewrap resolver unavailable"
+            if p and not resolver_ready
+            else None
+        ),
+    }
+    p = which("grok")
+    tools["grok"] = {
+        "present": bool(p and bwrap_ready and resolver_ready),
+        "binary_present": bool(p),
+        "path": p,
+        "version": run_version(["grok", "--version"]) if p else None,
+        "required": False,
+        "unavailable_reason": (
+            "bubblewrap missing"
+            if p and not bwrap
+            else "bubblewrap probe failed"
+            if p and not bwrap_ready
+            else "bubblewrap resolver unavailable"
+            if p and not resolver_ready
+            else None
+        ),
+    }
+    p = which("qwen")
+    tools["qwen"] = {
+        "present": bool(p and bwrap_ready and resolver_ready),
+        "binary_present": bool(p),
+        "path": p,
+        "version": run_version(["qwen", "--version"]) if p else None,
+        "required": False,
+        "unavailable_reason": (
+            "bubblewrap missing"
+            if p and not bwrap
+            else "bubblewrap probe failed"
+            if p and not bwrap_ready
+            else "bubblewrap resolver unavailable"
+            if p and not resolver_ready
+            else None
+        ),
+    }
+    p = which("kimi")
+    tools["kimi"] = {
+        "present": bool(p and bwrap_ready and resolver_ready),
+        "binary_present": bool(p),
+        "path": p,
+        "version": run_version(["kimi", "--version"]) if p else None,
+        "required": False,
+        "unavailable_reason": (
+            "bubblewrap missing"
+            if p and not bwrap
+            else "bubblewrap probe failed"
+            if p and not bwrap_ready
+            else "bubblewrap resolver unavailable"
+            if p and not resolver_ready
+            else None
+        ),
+    }
+    tools["bubblewrap"] = {
+        "present": bool(bwrap),
+        "operational": bwrap_ready,
+        "resolver_operational": resolver_ready,
+        "path": bwrap,
+        "version": None,
+        "required": False,
+    }
+    p = which("codex")
+    tools["codex"] = {
+        "present": bool(p),
+        "path": p,
+        "version": run_version(["codex", "--version"]) if p else None,
+        "required": False,
+    }
+    # Prefer real binary; wrapper `agent` may open an interactive project picker.
+    p = which("cursor-agent") or which("agent")
+    tools["cursor"] = {
+        "present": bool(p and bwrap_ready and resolver_ready),
+        "binary_present": bool(p),
+        "path": p,
+        "version": run_version([p, "--version"]) if p else None,
+        "required": False,
+        "unavailable_reason": (
+            "bubblewrap missing"
+            if p and not bwrap
+            else "bubblewrap probe failed"
+            if p and not bwrap_ready
+            else "bubblewrap resolver unavailable"
+            if p and not resolver_ready
+            else None
+        ),
+    }
+    p = which("opencode")
+    tools["opencode"] = {
+        "present": bool(p and bwrap_ready and resolver_ready),
+        "binary_present": bool(p),
+        "path": p,
+        "version": run_version(["opencode", "--version"]) if p else None,
+        "required": False,
+        "unavailable_reason": (
+            "bubblewrap missing"
+            if p and not bwrap
+            else "bubblewrap probe failed"
+            if p and not bwrap_ready
+            else "bubblewrap resolver unavailable"
+            if p and not resolver_ready
+            else None
+        ),
+    }
+    return tools
+
+
+PREFERRED_CURSOR_MODELS = frozenset(
+    {"cursor-grok-4.6-medium", "cursor-grok-4.6-medium-fast"}
+)
+DEFAULT_CURSOR_MODEL = "cursor-grok-4.6-medium"
+DEFAULT_CURSOR_EFFORT = "medium"
+DEFAULT_CURSOR_TIER = "fast"
+FALLBACK_CODEX_MODEL = "gpt-5.6-luna"
+FALLBACK_CODEX_EFFORT = "high"
+FALLBACK_CODEX_TIER = "fast"
+
+
+def list_cursor_models(binary: str | None = None) -> list[str]:
+    """Parse `cursor-agent --list-models`. Empty list = probe failed or no CLI."""
+    path = binary or which("cursor-agent") or which("agent")
+    if not path:
+        return []
+    models: list[str] = []
+    for line in command_lines([path, "--list-models"], timeout=12):
+        token = line.strip().split()[0] if line.strip() else ""
+        if not token or token.lower() in {"available", "models", "model"}:
+            continue
+        if token.endswith("-") or token.startswith("-"):
+            continue
+        cleaned = token.replace("_", "").replace("-", "").replace(".", "")
+        cleaned = cleaned.replace("/", "").replace(":", "")
+        if cleaned.isalnum():
+            models.append(token)
+    return list(dict.fromkeys(models))
+
+
+def cursor_default_writer_ready(tools: dict) -> bool:
+    """True when Cursor is a usable writer and Grok 4.6 medium(-fast) is listed."""
+    cur = tools.get("cursor") or {}
+    if not cur.get("present"):
+        return False
+    models = list_cursor_models(cur.get("path"))
+    if not models:
+        # ponytail: list-models failed — CLI is present; keep Cursor default.
+        # Upgrade: treat empty live catalog as missing and force Codex fallback.
+        return True
+    return bool(PREFERRED_CURSOR_MODELS.intersection(models))
+
+
+def pick_auto_writer(has: dict, tools: dict) -> str | None:
+    if cursor_default_writer_ready(tools):
+        return "cursor"
+    if has.get("codex"):
+        return "codex"
+    for name in ("kimi", "qwen", "grok", "agy", "opencode"):
+        if has.get(name):
+            return name
+    return None
+
+
+def pick_profile(
+    tools: dict, writer_provider: str = "auto"
+) -> tuple[str, dict, list[str]]:
+    notes: list[str] = []
+    has = {
+        k: tools[k]["present"]
+        for k in ("claude", "agy", "grok", "codex", "qwen", "kimi", "cursor", "opencode")
+    }
+    writer = (
+        writer_provider
+        if writer_provider != "auto" and has.get(writer_provider)
+        else pick_auto_writer(has, tools)
+    )
+    if writer_provider == "auto" and writer == "codex":
+        notes.append(
+            "Cursor Grok 4.6 medium-fast unavailable — "
+            "write via Codex luna high fast"
+        )
+    if writer_provider != "auto" and not has.get(writer_provider):
+        notes.append(f"Requested writer {writer_provider} unavailable; using {writer or 'fallback'}")
+    if tools["agy"].get("binary_present") and not has["agy"]:
+        reason = tools["agy"].get("unavailable_reason") or "unavailable"
+        notes.append(f"AGY disabled ({reason})")
+    if tools["grok"].get("binary_present") and not has["grok"]:
+        reason = tools["grok"].get("unavailable_reason") or "bubblewrap unavailable"
+        notes.append(
+            "Grok disabled — bubblewrap is required for safe writer lanes "
+            f"({reason})"
+        )
+    if tools["qwen"].get("binary_present") and not has["qwen"]:
+        reason = tools["qwen"].get("unavailable_reason") or "bubblewrap unavailable"
+        notes.append(
+            "Qwen disabled — bubblewrap is required for safe writer lanes "
+            f"({reason})"
+        )
+    if tools["kimi"].get("binary_present") and not has["kimi"]:
+        reason = tools["kimi"].get("unavailable_reason") or "bubblewrap unavailable"
+        notes.append(
+            "Kimi disabled — bubblewrap is required for safe writer lanes "
+            f"({reason})"
+        )
+    if tools["cursor"].get("binary_present") and not has["cursor"]:
+        reason = tools["cursor"].get("unavailable_reason") or "bubblewrap unavailable"
+        notes.append(
+            "Cursor disabled — bubblewrap is required for safe writer lanes "
+            f"({reason})"
+        )
+    if tools["opencode"].get("binary_present") and not has["opencode"]:
+        reason = tools["opencode"].get("unavailable_reason") or "bubblewrap unavailable"
+        notes.append(
+            "OpenCode disabled — bubblewrap is required for safe writer lanes "
+            f"({reason})"
+        )
+    if not has["claude"]:
+        notes.append("Claude Code missing — install required for PM")
+        return "none", {}, notes
+
+    if writer and has["codex"]:
+        name = "full"
+        lanes = dict(PROFILES[name])
+        lanes["fast_write"] = writer
+        lanes["main_write"] = writer
+    elif writer:
+        name = f"claude-{writer}"
+        lanes = dict(PROFILES[name])
+        notes.append("Codex missing → review falls back to Claude reviewer")
+    elif has["codex"]:
+        name = "claude-codex"
+        lanes = dict(PROFILES[name])
+        notes.append("Qwen/AGY/Grok missing — write + review via Codex")
+    else:
+        name = "claude-only"
+        lanes = dict(PROFILES[name])
+        notes.append("No Qwen/AGY/Grok/Codex — Claude subagents only")
+
+    return name, lanes, notes
+
+
+WRITER_CHOICES = ("auto", "kimi", "qwen", "agy", "grok", "codex", "cursor", "opencode")
+# Interactive setup default: Cursor Grok 4.6 medium-fast, else Codex luna high fast.
+SETUP_WRITER_PREF = ("cursor", "codex", "qwen", "kimi", "grok", "agy", "opencode")
+
+
+def available_writers(tools: dict) -> list[str]:
+    return [name for name in SETUP_WRITER_PREF if tools.get(name, {}).get("present")]
+
+
+def default_setup_writer(tools: dict) -> str:
+    if cursor_default_writer_ready(tools):
+        return "cursor"
+    if tools.get("codex", {}).get("present"):
+        return "codex"
+    for name in available_writers(tools):
+        if name != "cursor":
+            return name
+    return "auto"
+
+
+def write_outputs(
+    repo: Path,
+    tools: dict,
+    profile: str,
+    lanes: dict,
+    notes: list[str],
+    *,
+    writer_model: str | None = None,
+    writer_effort: str | None = None,
+    writer_service_tier: str | None = None,
+    auto_writer: bool = False,
+    workspace_mode: str | None = None,
+    worktree_min_score: int = 4,
+    worktree_on_multi_write: bool = True,
+    session_max_tasks: int = 10,
+    ui_language: str | None = None,
+    stages: dict | None = None,
+    writer_agent: str | None = None,
+    pm_read: dict | None = None,
+    quiet: bool = False,
+) -> None:
+    try:
+        from pipeline_stages import (
+            DEFAULT_OPENCODE_WRITE_AGENT,
+            default_stages,
+            merge_stage_seed,
+            normalize_stages,
+            stages_to_yaml_lines,
+        )
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from pipeline_stages import (
+            DEFAULT_OPENCODE_WRITE_AGENT,
+            default_stages,
+            merge_stage_seed,
+            normalize_stages,
+            stages_to_yaml_lines,
+        )
+    agents = repo / ".agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    main_write = lanes.get("main_write")
+    opencode_agent = (writer_agent or DEFAULT_OPENCODE_WRITE_AGENT).strip() or (
+        DEFAULT_OPENCODE_WRITE_AGENT
+    )
+    # Defaults when caller only picks provider (CLI --apply without model flags).
+    default_models = {
+        "qwen": "qwen3.8-max-preview",
+        "kimi": "kimi-code/k3-256k",
+        "grok": "grok-4.5",
+        "agy": "gemini-3.7-flash-high",
+        "codex": "gpt-5.6-luna",
+        "cursor": DEFAULT_CURSOR_MODEL,
+        "opencode": "alibaba-token-plan/qwen3.8-max-preview",
+    }
+    default_efforts = {
+        "qwen": "medium",
+        "kimi": "medium",
+        "grok": "medium",
+        "agy": "high",
+        "codex": "max",
+        "cursor": DEFAULT_CURSOR_EFFORT,
+        "opencode": "medium",
+    }
+    if main_write == "cursor":
+        if not writer_model:
+            writer_model = DEFAULT_CURSOR_MODEL
+        if not writer_effort:
+            writer_effort = DEFAULT_CURSOR_EFFORT
+        if writer_service_tier is None:
+            writer_service_tier = DEFAULT_CURSOR_TIER
+    elif main_write == "codex" and auto_writer:
+        if not writer_model:
+            writer_model = FALLBACK_CODEX_MODEL
+        if not writer_effort:
+            writer_effort = FALLBACK_CODEX_EFFORT
+        if writer_service_tier is None:
+            writer_service_tier = FALLBACK_CODEX_TIER
+    elif main_write in default_models:
+        if not writer_model:
+            writer_model = default_models[main_write]
+        if not writer_effort:
+            writer_effort = default_efforts[main_write]
+    if main_write == "agy":
+        from routing_profile import resolve_agy_effort
+
+        writer_effort = resolve_agy_effort(writer_model or "", writer_effort or "")
+    try:
+        from pm_read import normalize_pm_read, resolve_pm_read
+        from routing_profile import load_routing_profile as _load_profile
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from pm_read import normalize_pm_read, resolve_pm_read
+        from routing_profile import load_routing_profile as _load_profile
+    prev_pr = _load_profile(repo).get("pm_read")
+    pr_seed = dict(prev_pr) if isinstance(prev_pr, dict) else {}
+    if isinstance(pm_read, dict):
+        pr_seed.update({k: v for k, v in pm_read.items() if v is not None})
+    pr = resolve_pm_read(normalize_pm_read(pr_seed), tools)
+    ws_mode = (workspace_mode or "auto").strip().lower()
+    if ws_mode not in {"in_place", "worktree", "auto"}:
+        ws_mode = "auto"
+    ws_min = max(0, min(10, int(worktree_min_score)))
+    session_max = max(1, min(10, int(session_max_tasks)))
+    caps = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "tools": tools,
+        "profile": profile,
+        "lanes": lanes,
+        "notes": notes,
+        "pm": "claude",
+        "writer": {
+            "provider": main_write,
+            "model": writer_model,
+            "reasoning_effort": writer_effort,
+            **(
+                {
+                    "service_tier": (
+                        "fast"
+                        if str(writer_service_tier or "").strip().lower()
+                        in {"fast", "1", "true", "yes", "on"}
+                        else "standard"
+                    )
+                }
+                if main_write in {"codex", "cursor"}
+                else {}
+            ),
+            **(
+                {"agent": opencode_agent}
+                if main_write == "opencode"
+                else {}
+            ),
+        },
+        "workspace": {
+            "mode": ws_mode,
+            "worktree_min_score": ws_min,
+            "worktree_on_multi_write": bool(worktree_on_multi_write),
+            "session_max_tasks": session_max,
+        },
+        "ui": {
+            "language": (ui_language or "en").strip().lower()
+            if (ui_language or "en").strip().lower() in {"en", "ru"}
+            else "en",
+        },
+        "pm_read": pr,
+    }
+    (agents / "capabilities.json").write_text(
+        json.dumps(caps, indent=2) + "\n", encoding="utf-8"
+    )
+
+    lines = [
+        "# routing.profile.yaml — generated by agents-doctor",
+        f"# {caps['generated_at']}",
+        "pm: claude  # fixed — Claude Lane Stack requires Claude Code as orchestrator",
+        f"profile: {profile}",
+        "lanes:",
+    ]
+    for k, v in lanes.items():
+        agent = AGENT_MAP.get(v, v)
+        if k == "review" and v == "codex":
+            agent = "night-reviewer"
+        if k == "emergency_write" and v == "codex":
+            agent = "emergency-writer"
+        if k in ("fast_write", "main_write") and v == "codex":
+            agent = "run-supervisor"  # process writer, not emergency-writer
+        lines.append(f"  {k}: {v}  # agent: {agent}")
+    # Explicit writer model/effort for run-supervisor / run-controller.
+    if main_write and main_write not in ("claude-worker",):
+        lines.append("writer:")
+        lines.append(f"  provider: {main_write}")
+        if writer_model:
+            lines.append(f"  model: {writer_model}")
+        if writer_effort:
+            lines.append(f"  reasoning_effort: {writer_effort}")
+        if main_write == "opencode":
+            agent = opencode_agent
+            lines.append(f"  agent: {agent}")
+        if main_write in {"codex", "cursor"}:
+            tier_raw = str(writer_service_tier or "standard").strip().lower()
+            tier = (
+                "fast"
+                if tier_raw in {"fast", "1", "true", "yes", "on"}
+                else "standard"
+            )
+            hint = (
+                "Codex ChatGPT credit speed"
+                if main_write == "codex"
+                else "Cursor -fast model sibling"
+            )
+            lines.append(f"  service_tier: {tier}  # standard | fast ({hint})")
+    # Workspace: where writers edit (main checkout vs isolated worktree).
+    lines.append("workspace:")
+    lines.append(
+        f"  mode: {ws_mode}  # in_place | worktree | auto"
+    )
+    lines.append(
+        f"  worktree_min_score: {ws_min}  # auto: use worktree when score ≥ this"
+    )
+    lines.append(
+        "  worktree_on_multi_write: "
+        f"{'true' if worktree_on_multi_write else 'false'}  "
+        "# auto: worktree when ≥2 write tasks"
+    )
+    lines.append(
+        f"  session_max_tasks: {session_max}  "
+        "# 1–10 warm tasks per writer session; 1 = new session every task"
+    )
+    ui_lang = caps["ui"]["language"]
+    lines.append("ui:")
+    lines.append(f"  language: {ui_lang}  # en | ru  (agents-doctor TUI only)")
+    lines.append("pm_read:")
+    lines.append(
+        f"  enabled: {'true' if pr['enabled'] else 'false'}  "
+        "# PM Read >N lines → cheap model brief, not Fable context"
+    )
+    lines.append(f"  min_lines: {pr['min_lines']}")
+    lines.append(f"  provider: {pr['provider']}")
+    lines.append(f"  model: {pr['model']}")
+    lines.append(f"  reasoning_effort: {pr['reasoning_effort']}")
+    lines.append(
+        f"  service_tier: {pr.get('service_tier') or 'standard'}  "
+        "# Codex terra uses fast; others standard"
+    )
+    # Pipeline stages (plan critique / write / night / specialist / onboard).
+    night_enabled = False
+    night_path = agents / "night-shift.yaml"
+    if night_path.is_file():
+        try:
+            for raw in night_path.read_text(encoding="utf-8").splitlines():
+                s = raw.strip()
+                if s.startswith("enabled:"):
+                    night_enabled = "true" in s.lower()
+        except OSError:
+            pass
+    try:
+        from routing_profile import load_routing_profile
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from routing_profile import load_routing_profile
+    prev = load_routing_profile(repo).get("stages")
+    stage_seed = merge_stage_seed(
+        default_stages(
+            write_provider=str(main_write or "kimi"),
+            write_model=writer_model,
+            write_effort=writer_effort,
+            night_enabled=night_enabled,
+        ),
+        prev if isinstance(prev, dict) else {},
+    )
+    if isinstance(stages, dict):
+        stage_seed = merge_stage_seed(stage_seed, stages)
+    # Keep write stage aligned with main_write / model / effort.
+    stage_seed = dict(stage_seed)
+    stage_seed["write"] = {
+        **(stage_seed.get("write") if isinstance(stage_seed.get("write"), dict) else {}),
+        "provider": main_write,
+        "model": writer_model,
+        "reasoning_effort": writer_effort,
+    }
+    if main_write == "opencode":
+        stage_seed["write"]["agent"] = opencode_agent
+    if "night_review" in stage_seed and isinstance(stage_seed["night_review"], dict):
+        stage_seed["night_review"] = {
+            **stage_seed["night_review"],
+            "enabled": night_enabled
+            if "enabled" not in stage_seed["night_review"]
+            else stage_seed["night_review"].get("enabled", night_enabled),
+        }
+    normalized_stages = normalize_stages(
+        stage_seed, write_provider=str(main_write or "kimi")
+    )
+    caps["stages"] = normalized_stages
+    lines.extend(stages_to_yaml_lines(normalized_stages))
+    lines.append("notes:")
+    if notes:
+        for n in notes:
+            lines.append(f"  - {json.dumps(n)}")
+    else:
+        lines.append("  - []")
+    lines.append("")
+    # Re-write capabilities with stages included.
+    (agents / "capabilities.json").write_text(
+        json.dumps(caps, indent=2) + "\n", encoding="utf-8"
+    )
+    (agents / "routing.profile.yaml").write_text("\n".join(lines), encoding="utf-8")
+    mem = (
+        normalized_stages.get("memory")
+        if isinstance(normalized_stages.get("memory"), dict)
+        else {}
+    )
+    if mem.get("enabled"):
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import lane_memory as lm  # noqa: WPS433
+
+            lm.init_corpus(repo)
+        except Exception as exc:  # noqa: BLE001
+            if not quiet:
+                print(f"WARN: lane-memory init/inject skipped: {exc}")
+    try:
+        _ensure_pm_read_hook(enabled=bool(pr.get("enabled")))
+    except Exception as exc:  # noqa: BLE001
+        if not quiet:
+            print(f"WARN: pm_read hook merge skipped: {exc}")
+    if not quiet:
+        print(f"Wrote {agents / 'capabilities.json'}")
+        print(f"Wrote {agents / 'routing.profile.yaml'}")
+
+
+def _ensure_pm_read_hook(*, enabled: bool = True) -> None:
+    if not enabled:
+        return
+    if "unittest" in sys.modules:
+        return
+    settings = Path.home() / ".claude" / "settings.json"
+    if not settings.is_file():
+        return
+    here = Path(__file__).resolve().parent.parent / "hooks" / "pm_bulk_read.py"
+    dest = Path.home() / ".agents" / "hooks" / "pm_bulk_read.py"
+    hook = dest if dest.is_file() else here
+    if not hook.is_file():
+        return
+    hooks_dir = str(hook.parent)
+    if hooks_dir not in sys.path:
+        sys.path.insert(0, hooks_dir)
+    from merge_claude_settings import load_settings, merge_pm_bulk_read, write_settings
+
+    write_settings(settings, merge_pm_bulk_read(load_settings(settings), hook))
+
+
+def write_night_shift(
+    repo: Path,
+    *,
+    enabled: bool,
+    provider: str | None,
+    max_fix_tasks: int = 5,
+    auto_merge: bool = False,
+    quiet: bool = False,
+) -> Path:
+    """Write .agents/night-shift.yaml (opt-in/out for night-shift-all)."""
+    agents = repo / ".agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    path = agents / "night-shift.yaml"
+    lines = [
+        "# night-shift.yaml — generated by agents-doctor setup",
+        f"# {datetime.now(timezone.utc).isoformat()}",
+        f"enabled: {'true' if enabled else 'false'}",
+        f"auto_merge: {'true' if auto_merge else 'false'}",
+    ]
+    if provider:
+        lines.append(f"provider: {provider}")
+    if enabled:
+        lines.append(f"max_fix_tasks: {max_fix_tasks}")
+    else:
+        lines.append(
+            "# Night Codex review + writer repair disabled for this project."
+        )
+        lines.append("# Re-enable: set enabled: true (or re-run agents-doctor setup).")
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    if not quiet:
+        print(f"Wrote {path}")
+    return path
+
+
+def print_detection(tools: dict, profile: str, lanes: dict, notes: list[str]) -> None:
+    print("Claude Lane Stack — agents-doctor\n")
+    for name, info in tools.items():
+        mark = "✓" if info["present"] else "✗"
+        req = " (required)" if info.get("required") else ""
+        ver = info.get("version") or ""
+        print(f"  {mark} {name:8} {ver}{req}")
+    print(f"\nProfile: {profile}")
+    if lanes:
+        print("Lanes:")
+        for k, v in lanes.items():
+            print(f"  {k:16} → {v}")
+    if notes:
+        print("Notes:")
+        for n in notes:
+            print(f"  - {n}")
+
+
+def _prompt(text: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    try:
+        raw = input(f"{text}{suffix}: ").strip()
+    except EOFError:
+        return default or ""
+    return raw if raw else (default or "")
+
+
+def _prompt_yes_no(text: str, *, default: bool) -> bool:
+    hint = "Y/n" if default else "y/N"
+    raw = _prompt(f"{text} ({hint})", "y" if default else "n").lower()
+    if raw in ("",):
+        return default
+    return raw in ("y", "yes", "1", "true", "on")
+
+
+def _prompt_choice(
+    title: str, options: list[str], *, default: str
+) -> str:
+    print(f"\n{title}")
+    for i, opt in enumerate(options, 1):
+        mark = " (default)" if opt == default else ""
+        print(f"  {i}) {opt}{mark}")
+    raw = _prompt("Choose number or name", default)
+    if raw.isdigit():
+        idx = int(raw)
+        if 1 <= idx <= len(options):
+            return options[idx - 1]
+    if raw in options:
+        return raw
+    print(f"  Unknown {raw!r}; using {default}")
+    return default
+
+
+def run_setup(
+    repo: Path,
+    *,
+    writer_provider: str | None = None,
+    night_review: bool | None = None,
+    max_fix_tasks: int | None = None,
+    auto_merge: bool | None = None,
+    interactive: bool = True,
+) -> int:
+    """Primary project setup: writer lane + optional night review."""
+    tools = detect()
+    if not tools["claude"]["present"]:
+        print("ERROR: Claude Code is required as PM.", file=sys.stderr)
+        return 1
+
+    requested_auto = writer_provider in (None, "auto")
+    writers = available_writers(tools)
+    suggested = default_setup_writer(tools)
+
+    print(f"==> agents-doctor setup: {repo}\n")
+    detect_profile, detect_lanes, detect_notes = pick_profile(tools, "auto")
+    print_detection(tools, detect_profile, detect_lanes, detect_notes)
+
+    if interactive and writer_provider is None:
+        choices = writers if writers else ["auto"]
+        if "auto" not in choices:
+            choices = [*choices, "auto"]
+        print(
+            "\n--- Writer (daytime coder) ---\n"
+            "PM is always Claude. This is who implements task YAML.\n"
+            "Default: Cursor Grok 4.6 medium-fast; else Codex luna high fast.\n"
+            "codex opt-in (explicit) = gpt-5.6-luna + reasoning effort max."
+        )
+        writer_provider = _prompt_choice(
+            "Daytime writer provider",
+            choices,
+            default=suggested if suggested in choices else choices[0],
+        )
+    elif writer_provider is None:
+        writer_provider = suggested
+
+    profile, lanes, notes = pick_profile(tools, writer_provider)
+    resolved_writer = lanes.get("main_write") if lanes else None
+    if resolved_writer in ("claude-worker", "codex", None):
+        # codex/claude-only profiles — night repair writer may still be set
+        night_provider = (
+            writers[0] if writers else None
+        )
+    else:
+        night_provider = str(resolved_writer)
+
+    if interactive and night_review is None:
+        print(
+            "\n--- Night review (Codex Sol) ---\n"
+            "Cron runs night-shift-all: Codex reviews recent commits, then a\n"
+            "writer may open bounded fix tasks. Not every project needs this\n"
+            "(marketing sites, static pages, experiments → usually off)."
+        )
+        night_review = _prompt_yes_no(
+            "Enable night review + repair for this project?", default=False
+        )
+    elif night_review is None:
+        night_review = False
+
+    if night_review:
+        if interactive and max_fix_tasks is None:
+            raw = _prompt("Max fix tasks per night (1–10)", "5")
+            try:
+                max_fix_tasks = max(1, min(10, int(raw)))
+            except ValueError:
+                max_fix_tasks = 5
+        elif max_fix_tasks is None:
+            max_fix_tasks = 5
+        if interactive and auto_merge is None:
+            auto_merge = _prompt_yes_no(
+                "Allow night auto-merge to main when green? (usually no)",
+                default=False,
+            )
+        elif auto_merge is None:
+            auto_merge = False
+        if interactive and night_provider and writers:
+            print(
+                "\nNight repair writer (after Codex findings). "
+                "CLI --provider on cron overrides this."
+            )
+            night_provider = _prompt_choice(
+                "Night fix writer",
+                writers,
+                default=night_provider if night_provider in writers else writers[0],
+            )
+    else:
+        max_fix_tasks = max_fix_tasks or 5
+        auto_merge = bool(auto_merge) if auto_merge is not None else False
+
+    print("\n--- Applying ---")
+    print(f"  writer:       {resolved_writer or writer_provider}  (profile: {profile})")
+    print(f"  night_review: {'on' if night_review else 'off'}")
+    if night_review:
+        print(f"  night provider: {night_provider}")
+        print(f"  max_fix_tasks: {max_fix_tasks}")
+        print(f"  auto_merge:     {auto_merge}")
+
+    write_outputs(
+        repo, tools, profile, lanes, notes, auto_writer=requested_auto
+    )
+    write_night_shift(
+        repo,
+        enabled=bool(night_review),
+        provider=night_provider if night_review else (night_provider or "qwen"),
+        max_fix_tasks=int(max_fix_tasks or 5),
+        auto_merge=bool(auto_merge),
+    )
+
+    print(
+        "\nDone. Orchestrator will use main_write from "
+        ".agents/routing.profile.yaml.\n"
+        "Next (optional):\n"
+        "  project-onboard .          # CLAUDE.md / PROGRESS / docs passport\n"
+        "  project-memory-init .      # PROGRESS + LESSONS only\n"
+        "Re-run anytime: agents-doctor setup ."
+    )
+    return 0
+
+
+def setup_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="agents-doctor setup",
+        description=(
+            "Interactive (or flags) first-time project setup: daytime writer + "
+            "optional night review policy"
+        ),
+    )
+    ap.add_argument("repo", nargs="?", default=".")
+    ap.add_argument(
+        "--writer-provider",
+        choices=WRITER_CHOICES,
+        default=None,
+        help="daytime writer (default: cursor grok-4.6-medium-fast, else luna high fast)",
+    )
+    ap.add_argument(
+        "--night-review",
+        choices=("on", "off"),
+        default=None,
+        help="enable Codex night review + repair (default: ask, or off if non-TTY)",
+    )
+    ap.add_argument(
+        "--max-fix-tasks",
+        type=int,
+        default=None,
+        help="cap night fix tasks when night-review is on (1–10, default 5)",
+    )
+    ap.add_argument(
+        "--auto-merge",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="allow night auto-merge when project + CLI both opt in (default: false)",
+    )
+    ap.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="non-interactive: no prompts (use flags / defaults)",
+    )
+    args = ap.parse_args(argv)
+    repo = Path(args.repo).expanduser().resolve()
+    if not repo.is_dir():
+        print(f"ERROR: not a directory: {repo}", file=sys.stderr)
+        return 2
+
+    interactive = (not args.yes) and sys.stdin.isatty() and sys.stdout.isatty()
+    night: bool | None
+    if args.night_review == "on":
+        night = True
+    elif args.night_review == "off":
+        night = False
+    else:
+        night = None if interactive else False
+
+    max_fix = args.max_fix_tasks
+    if max_fix is not None:
+        max_fix = max(1, min(10, max_fix))
+
+    return run_setup(
+        repo,
+        writer_provider=args.writer_provider,
+        night_review=night,
+        max_fix_tasks=max_fix,
+        auto_merge=args.auto_merge,
+        interactive=interactive,
+    )
+
+
+def _run_tui(repo: Path) -> int:
+    """Load sibling TUI module (tabs / toggles) for interactive project config."""
+    try:
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+
+        tui_path = Path(__file__).resolve().parent / "agents_doctor_tui.py"
+        if not tui_path.is_file():
+            raise FileNotFoundError(tui_path)
+        loader = SourceFileLoader("agents_doctor_tui", str(tui_path))
+        spec = importlib.util.spec_from_loader("agents_doctor_tui", loader)
+        if spec is None or spec.loader is None:
+            raise ImportError("cannot load agents_doctor_tui")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["agents_doctor_tui"] = mod
+        # Current process module exposes detect/write_* helpers to the TUI.
+        sys.modules["agents_doctor"] = sys.modules[__name__]
+        spec.loader.exec_module(mod)
+        return int(mod.run_tui(repo, sys.modules[__name__]))
+    except Exception as exc:  # noqa: BLE001 — fall back to linear setup
+        print(f"TUI unavailable ({exc}); using setup wizard.", file=sys.stderr)
+        return run_setup(repo, interactive=True)
+
+
+def _reexec_from_source_repo() -> None:
+    """Stale ~/.agents copy jumps to install.json source_repo."""
+    here = Path(__file__).resolve()
+    install = Path.home() / ".agents" / "install.json"
+    if not install.is_file():
+        return
+    try:
+        data = json.loads(install.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    repo = Path(str(data.get("source_repo") or "")).expanduser()
+    source = (repo / "bin" / "agents-doctor").resolve()
+    if not source.is_file() or source == here:
+        return
+    os.execv(sys.executable, [sys.executable, str(source), *sys.argv[1:]])
+
+
+def main(argv: list[str] | None = None) -> int:
+    _reexec_from_source_repo()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"setup"}:
+        return setup_main(argv[1:])
+    if argv and argv[0] in {"tui", "ui", "configure", "config"}:
+        repo = Path(argv[1] if len(argv) > 1 else ".").expanduser().resolve()
+        if not repo.is_dir():
+            print(f"ERROR: not a directory: {repo}", file=sys.stderr)
+            return 2
+        return _run_tui(repo)
+
+    ap = argparse.ArgumentParser(
+        description=(
+            "Claude Lane Stack doctor — detect CLIs and configure project routing.\n"
+            "  adoc / agents-doctor              # TUI in a terminal (cwd project)\n"
+            "  adoc tui [path]                   # same, explicit\n"
+            "  adoc setup [path]                 # linear wizard (no full-screen UI)\n"
+            "  adoc --apply --writer-provider …  # non-interactive flags\n"
+            "Short name: adoc  (same binary path via wrapper)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("repo", nargs="?", default=".")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="write .agents/capabilities.json + routing.profile.yaml",
+    )
+    ap.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="never open the full-screen TUI (report only unless --apply)",
+    )
+    ap.add_argument(
+        "--writer-provider",
+        choices=WRITER_CHOICES,
+        default="auto",
+        help="preferred writer provider (default: auto, Cursor Grok 4.6 medium-fast else Codex luna high fast)",
+    )
+    ap.add_argument(
+        "--night-review",
+        choices=("on", "off"),
+        default=None,
+        help="with --apply: also write night-shift.yaml (on|off)",
+    )
+    ap.add_argument(
+        "--max-fix-tasks",
+        type=int,
+        default=5,
+        help="with --apply --night-review on: max fix tasks (default 5)",
+    )
+    ap.add_argument(
+        "--auto-merge",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="with --apply --night-review on: set auto_merge (default false)",
+    )
+    ap.add_argument(
+        "--workspace-mode",
+        choices=("in_place", "worktree", "auto"),
+        default=None,
+        help="with --apply: where writers edit (default: auto)",
+    )
+    ap.add_argument(
+        "--worktree-min-score",
+        type=int,
+        default=4,
+        help="with --apply: auto mode uses worktree when score ≥ N (default 4)",
+    )
+    ap.add_argument(
+        "--worktree-on-multi-write",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --apply: auto mode uses worktree when ≥2 write tasks (default true)",
+    )
+    ap.add_argument(
+        "--session-max-tasks",
+        type=int,
+        default=10,
+        help="with --apply: warm writer tasks per session (1–10; 1 = new session every task)",
+    )
+    ap.add_argument(
+        "--plan-critique",
+        choices=("on", "off"),
+        default=None,
+        help="with --apply: enable plan_critique stage (default on)",
+    )
+    ap.add_argument(
+        "--plan-critique-mode",
+        choices=("advisory", "gate"),
+        default=None,
+        help="with --apply: advisory (soft) or gate (block pre-dispatch)",
+    )
+    ap.add_argument(
+        "--plan-critique-provider",
+        choices=("structural", "kimi", "qwen", "agy", "grok", "codex", "cursor", "opencode"),
+        default=None,
+        help="with --apply: structural engine + optional cheap model for LLM pass",
+    )
+    ap.add_argument(
+        "--writer-model",
+        default=None,
+        help="with --apply: writer model id (e.g. gpt-5.6-luna)",
+    )
+    ap.add_argument(
+        "--writer-agent",
+        default=None,
+        help="with --apply: OpenCode agent name (default: build)",
+    )
+    ap.add_argument(
+        "--writer-effort",
+        "--reasoning-effort",
+        dest="writer_effort",
+        default=None,
+        help="with --apply: writer reasoning effort (codex: low|medium|high|xhigh|max)",
+    )
+    ap.add_argument(
+        "--service-tier",
+        choices=("standard", "fast"),
+        default=None,
+        help="with --apply: codex ChatGPT speed tier (default standard; fast ≈ 2.5× credits)",
+    )
+    ap.add_argument(
+        "--fast-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="with --apply: codex fast mode on/off (alias for --service-tier fast|standard)",
+    )
+    args = ap.parse_args(argv)
+
+    # Default interactive entry: full-screen project configurator.
+    want_tui = (
+        not args.json
+        and not args.apply
+        and not args.no_tui
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and args.writer_provider == "auto"
+        and args.night_review is None
+        and args.workspace_mode is None
+    )
+    if want_tui:
+        repo = Path(args.repo).expanduser().resolve()
+        if not repo.is_dir():
+            print(f"ERROR: not a directory: {repo}", file=sys.stderr)
+            return 2
+        return _run_tui(repo)
+
+    tools = detect()
+    profile, lanes, notes = pick_profile(tools, args.writer_provider)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "pm": "claude",
+                    "tools": tools,
+                    "profile": profile,
+                    "lanes": lanes,
+                    "notes": notes,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print_detection(tools, profile, lanes, notes)
+        if not args.apply:
+            print(
+                "\nTip: interactive UI:  agents-doctor\n"
+                "     linear wizard:   agents-doctor setup .\n"
+                "     quick apply:     agents-doctor --apply --writer-provider codex "
+                "--night-review off ."
+            )
+
+    if not tools["claude"]["present"]:
+        print("\nERROR: Claude Code is required as PM.", file=sys.stderr)
+        return 1
+
+    if args.apply:
+        repo = Path(args.repo).expanduser().resolve()
+        stages_arg: dict | None = None
+        if (
+            args.plan_critique is not None
+            or args.plan_critique_mode is not None
+            or args.plan_critique_provider is not None
+        ):
+            pc: dict = {}
+            if args.plan_critique is not None:
+                pc["enabled"] = args.plan_critique == "on"
+            if args.plan_critique_mode is not None:
+                pc["mode"] = args.plan_critique_mode
+            if args.plan_critique_provider is not None:
+                pc["provider"] = args.plan_critique_provider
+            stages_arg = {"plan_critique": pc}
+        if args.night_review is not None:
+            writer = lanes.get("main_write")
+            provider = (
+                writer
+                if writer in {"kimi", "qwen", "agy", "grok", "codex", "cursor", "opencode"}
+                else default_setup_writer(tools)
+            )
+            if provider == "auto":
+                provider = None
+            write_night_shift(
+                repo,
+                enabled=(args.night_review == "on"),
+                provider=provider if provider != "auto" else None,
+                max_fix_tasks=max(1, min(10, args.max_fix_tasks)),
+                auto_merge=bool(args.auto_merge),
+            )
+        # Codex speed tier: --service-tier wins; else --fast-mode / --no-fast-mode.
+        service_tier = args.service_tier
+        if service_tier is None and args.fast_mode is not None:
+            service_tier = "fast" if args.fast_mode else "standard"
+        write_outputs(
+            repo,
+            tools,
+            profile,
+            lanes,
+            notes,
+            writer_model=args.writer_model,
+            writer_effort=args.writer_effort,
+            writer_agent=args.writer_agent,
+            writer_service_tier=service_tier,
+            auto_writer=args.writer_provider == "auto",
+            workspace_mode=args.workspace_mode or "auto",
+            worktree_min_score=max(0, min(10, int(args.worktree_min_score))),
+            worktree_on_multi_write=bool(args.worktree_on_multi_write),
+            session_max_tasks=max(1, min(10, int(args.session_max_tasks))),
+            stages=stages_arg,
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

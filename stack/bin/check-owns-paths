@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""Verify task changes stay inside owns_paths; never_touch clean.
+
+On main/master: uncommitted-only (dirty tree is common).
+On feature/worktree branch: merge-base(main)...HEAD + uncommitted.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+try:
+    import yaml  # type: ignore
+except ImportError:
+    yaml = None
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from gate_log import record_gate_event, run_slug_from_run_dir  # type: ignore
+except Exception:  # pragma: no cover - observability must never break the gate
+    def record_gate_event(*args, **kwargs):  # type: ignore
+        pass
+
+    def run_slug_from_run_dir(run_dir):  # type: ignore
+        return None
+
+IGNORE_PREFIXES = (
+    ".agents/",
+    ".repowise/",
+    ".worktrees/",
+    ".claude/worktrees/",
+    "node_modules/",
+    # Package-manager / tool caches — writers often fill these while running
+    # typecheck/test/install; they are never product owns_paths.
+    ".npm-cache/",
+    "npm-cache/",
+    ".npm/",
+    ".pnpm-store/",
+    "pnpm-store/",
+    ".yarn/cache/",
+    ".yarn/unplugged/",
+    ".cache/",
+    ".turbo/",
+    ".next/cache/",
+    "coverage/",
+    ".git/",
+)
+# Living-memory files (legacy root + canonical .agents/) are maintained by
+# orchestration tooling (session-ledger flush, project-memory, night-audit),
+# never by a task writer. Root copies stay ignored during migration.
+# Canonical paths are already covered by IGNORE_PREFIXES ".agents/".
+# Root AGENTS.md / CLAUDE.md: GitNexus injects a <!-- gitnexus:start -->
+# block on analyze; not a writer leak.
+IGNORE_FILES = (
+    "PROGRESS.md",
+    "LESSONS.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+)
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+class GitCommandError(RuntimeError):
+    pass
+
+
+class ScopeError(RuntimeError):
+    pass
+
+
+def load_task(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if yaml:
+        try:
+            data = yaml.safe_load(text) or {}
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    data: dict = {}
+    m = re.search(r"^project_cwd:\s*[\"']?([^\"'\n]+)", text, re.M)
+    if m:
+        data["project_cwd"] = m.group(1).strip()
+    return data
+
+
+def match_any(path: str, patterns: list) -> bool:
+    path = path.removeprefix("./")
+    for pat in patterns:
+        pat = str(pat).strip().strip('"').strip("'")
+        if not pat:
+            continue
+        if pat.endswith("/**"):
+            prefix = pat[:-3].rstrip("/")
+            if path == prefix or path.startswith(prefix + "/"):
+                return True
+        if fnmatch.fnmatch(path, pat):
+            return True
+        if path == pat or path.startswith(pat.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def run_git(cwd: Path, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        raise GitCommandError(f"cannot run git {' '.join(args)}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise GitCommandError(f"git {' '.join(args)} failed: {detail}")
+    return result.stdout
+
+
+def main_ref(cwd: Path) -> str:
+    for ref in ("main", "master"):
+        try:
+            run_git(cwd, "rev-parse", "--verify", ref)
+        except GitCommandError:
+            continue
+        else:
+            return ref
+    run_git(cwd, "rev-parse", "--verify", "HEAD")
+    return "HEAD"
+
+
+def filter_noise(files: list[str]) -> list[str]:
+    out = []
+    for f in files:
+        rel = f.removeprefix("./")
+        if any(rel.startswith(p) for p in IGNORE_PREFIXES):
+            continue
+        if rel in IGNORE_FILES:
+            continue
+        # Python bytecode caches appear after unittest/pytest; never product owns.
+        parts = PurePosixPath(rel).parts
+        if "__pycache__" in parts or rel.endswith((".pyc", ".pyo")):
+            continue
+        if ".pytest_cache" in parts or ".mypy_cache" in parts or ".ruff_cache" in parts:
+            continue
+        out.append(f)
+    return sorted(set(out))
+
+
+def uncommitted(cwd: Path) -> list[str]:
+    files: list[str] = []
+    for cmd in (
+        ["diff", "--name-only", "HEAD"],
+        ["diff", "--name-only", "--cached"],
+        ["ls-files", "--others", "--exclude-standard"],
+    ):
+        for line in run_git(cwd, *cmd).splitlines():
+            if line.strip():
+                files.append(line.strip())
+    return filter_noise(files)
+
+
+def branch_changes(cwd: Path, base: str) -> list[str]:
+    files: list[str] = []
+    mb = run_git(cwd, "merge-base", base, "HEAD").strip()
+    spec = f"{mb}...HEAD" if mb else f"{base}...HEAD"
+    for line in run_git(cwd, "diff", "--name-only", spec).splitlines():
+        if line.strip():
+            files.append(line.strip())
+    files.extend(uncommitted(cwd))
+    return filter_noise(files)
+
+
+def load_dirt_baseline(path: Path | None) -> set[str] | None:
+    """Return pre-task dirty paths, or None when no baseline was recorded."""
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, dict):
+        files = payload.get("files")
+    else:
+        files = payload
+    if not isinstance(files, list):
+        return None
+    return {str(item).removeprefix("./") for item in files if str(item).strip()}
+
+
+def write_dirt_baseline(cwd: Path, path: Path) -> list[str]:
+    """Snapshot uncommitted dirt at writer start so later owns can ignore foreign files."""
+    files = uncommitted(cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "cwd": str(cwd),
+        "files": files,
+    }
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+    return files
+
+
+# controller.json stages that still occupy a shared in_place tree.
+LIVE_SIBLING_STAGES = frozenset({"running", "pending", "blocked"})
+
+
+def _task_owns_patterns(task: dict) -> list[str]:
+    raw = task.get("owns_paths") or task.get("files") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _receipt_files(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    files = (
+        data.get("files_changed")
+        or data.get("evaluated_files")
+        or data.get("changed_files")
+        or []
+    )
+    if not isinstance(files, list):
+        return []
+    return [str(item).removeprefix("./") for item in files if str(item).strip()]
+
+
+def _accepted_run_still_dirty(run_dir: Path, receipt: dict, changed: set[str]) -> bool:
+    tasks = receipt.get("tasks")
+    if not isinstance(tasks, dict):
+        return False
+    for task_id in tasks:
+        if not SAFE_NAME.fullmatch(str(task_id)):
+            continue
+        art = run_dir / "artifacts" / str(task_id)
+        claimed = _receipt_files(art / "outcome.json") + _receipt_files(art / "owns-check.json")
+        if any(rel in changed for rel in claimed):
+            return True
+    return False
+
+
+def sibling_owns_patterns(task_path: Path, cwd: Path, changed: list[str]) -> list[str]:
+    """Owns globs from other in-tree runs that explain current dirt.
+
+    Live runs contribute all owns_paths. Accepted runs contribute only when
+    their recorded files_changed still appear in `changed` (unmerged leftover).
+    # ponytail: leftover run dirs can hide a leak into a path an old accepted
+    # run also listed in files_changed; upgrade: only unmerged / still-dirty runs.
+    """
+    if task_path.parent.name != "tasks":
+        return []
+    this_run = task_path.parent.parent
+    runs_root = this_run.parent
+    if runs_root.name != "runs":
+        return []
+    changed_set = {item.removeprefix("./") for item in changed}
+    patterns: list[str] = []
+    for run_dir in runs_root.iterdir():
+        if run_dir == this_run or not run_dir.is_dir() or run_dir.name.startswith("."):
+            continue
+        receipt_path = run_dir / "controller.json"
+        if not receipt_path.is_file():
+            continue
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(receipt, dict):
+            continue
+        raw_cwd = receipt.get("project_cwd")
+        if isinstance(raw_cwd, str) and raw_cwd:
+            try:
+                if Path(raw_cwd).resolve() != cwd:
+                    continue
+            except OSError:
+                continue
+        stage = str(receipt.get("stage") or "")
+        include = stage in LIVE_SIBLING_STAGES
+        if not include and stage == "accepted":
+            include = _accepted_run_still_dirty(run_dir, receipt, changed_set)
+        if not include:
+            continue
+        tasks_dir = run_dir / "tasks"
+        if not tasks_dir.is_dir():
+            continue
+        for candidate in tasks_dir.glob("*.yaml"):
+            patterns.extend(_task_owns_patterns(load_task(candidate)))
+    return patterns
+
+
+def evaluate_details(
+    changed: list[str],
+    owns: list,
+    never: list,
+    *,
+    baseline: set[str] | None = None,
+    sibling_owns: list | None = None,
+) -> dict:
+    """Classify tree dirt into owns violations, never_touch hits, and foreign ignored.
+
+    Foreign/parallel-session dirt outside owns_paths must not fail the task when
+    the writer did not introduce it. With a dirt baseline (files dirty at lane
+    start), only *new* outside-owns paths fail (writer leak), unless they match
+    a live/unmerged sibling run's owns_paths. Without a baseline, outside-owns
+    paths are treated as foreign (warn-only) so shared dirty mains do not freeze
+    runs; never_touch still hard-fails for newly introduced hits (or all hits
+    when no baseline).
+    """
+    sibling = list(sibling_owns or [])
+    violations: list[str] = []
+    never_hits: list[str] = []
+    foreign_ignored: list[str] = []
+    evaluated: list[str] = []
+    for f in changed:
+        rel = f.removeprefix("./")
+        in_baseline = baseline is not None and rel in baseline
+        if match_any(rel, never):
+            if in_baseline:
+                foreign_ignored.append(rel)
+            else:
+                never_hits.append(rel)
+                evaluated.append(rel)
+            continue
+        if owns and not match_any(rel, owns):
+            if in_baseline or match_any(rel, sibling):
+                foreign_ignored.append(rel)
+                continue
+            if baseline is not None:
+                violations.append(rel)
+                evaluated.append(rel)
+            else:
+                # No baseline: cannot attribute leak vs parallel dirt — ignore.
+                foreign_ignored.append(rel)
+            continue
+        evaluated.append(rel)
+    return {
+        "changed_files": changed,
+        "evaluated_files": evaluated,
+        "owns_paths": owns,
+        "never_touch": never,
+        "violations": violations,
+        "never_touch_hits": never_hits,
+        "foreign_ignored": foreign_ignored,
+        "sibling_owns": sibling,
+        "baseline_used": baseline is not None,
+        "status": (
+            "passed"
+            if owns and not violations and not never_hits
+            else ("skipped" if not owns else "failed")
+        ),
+    }
+
+
+def print_evaluation(details: dict) -> int:
+    changed = details["changed_files"]
+    owns = details["owns_paths"]
+    violations = details["violations"]
+    never_hits = details["never_touch_hits"]
+    foreign = details.get("foreign_ignored") or []
+    if not owns:
+        print("WARN: no owns_paths/files — skip strict check")
+        return 0
+    if not changed:
+        print("OK: no changed files to check")
+        return 0
+
+    if foreign:
+        print("WARN foreign dirt ignored (outside owns / pre-existing):")
+        for f in foreign[:40]:
+            print(f"  {f}")
+        if len(foreign) > 40:
+            print(f"  ... +{len(foreign) - 40} more")
+    if never_hits:
+        print("FAIL never_touch:")
+        for f in never_hits:
+            print(f"  {f}")
+    if violations:
+        print("FAIL outside owns_paths:")
+        for f in violations[:40]:
+            print(f"  {f}")
+        if len(violations) > 40:
+            print(f"  ... +{len(violations) - 40} more")
+        print("owns_paths:")
+        for p in owns:
+            print(f"  - {p}")
+    if never_hits or violations:
+        return 1
+    evaluated = details.get("evaluated_files") or []
+    print(
+        f"OK: {len(evaluated)} evaluated file(s) within owns_paths"
+        + (f" ({len(foreign)} foreign ignored)" if foreign else "")
+    )
+    for f in evaluated[:30]:
+        print(f"  {f}")
+    return 0
+
+
+def receipt_path_for(task_path: Path, task_id: str) -> Path | None:
+    if task_path.parent.name != "tasks":
+        return None
+    run_dir = task_path.parent.parent
+    if run_dir.parent.name != "runs" or run_dir.parent.parent.name != ".agents":
+        return None
+    return run_dir / "artifacts" / task_id / "owns-check.json"
+
+
+def write_receipt(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def run_scope_ownership(task_path: Path, cwd: Path) -> tuple[list[str], list[str], list[str]]:
+    tasks_dir = task_path.parent
+    if tasks_dir.name != "tasks" or not task_path.is_file():
+        raise ScopeError("--run-scope requires a task under RUN_DIR/tasks")
+    owns: set[str] = set()
+    never: set[str] = set()
+    task_ids: list[str] = []
+    seen: set[str] = set()
+    for candidate in sorted(tasks_dir.glob("*.yaml")):
+        task = load_task(candidate)
+        task_id = str(task.get("id") or "")
+        if not SAFE_NAME.fullmatch(task_id) or task_id in {".", ".."}:
+            raise ScopeError(f"invalid run task id in {candidate.name}")
+        if task_id in seen:
+            raise ScopeError(f"duplicate run task id: {task_id}")
+        seen.add(task_id)
+        raw_cwd = task.get("project_cwd")
+        if not isinstance(raw_cwd, str) or Path(raw_cwd).resolve() != cwd:
+            raise ScopeError(f"run task {task_id} project_cwd does not match --cwd")
+        raw_owns = task.get("owns_paths") or task.get("files") or []
+        raw_never = task.get("never_touch") or []
+        if isinstance(raw_owns, str):
+            raw_owns = [raw_owns]
+        if isinstance(raw_never, str):
+            raw_never = [raw_never]
+        if not isinstance(raw_owns, list) or not raw_owns:
+            raise ScopeError(f"run task {task_id} has no owns_paths")
+        if not isinstance(raw_never, list):
+            raise ScopeError(f"run task {task_id} never_touch must be a list")
+        owns.update(str(value) for value in raw_owns if str(value).strip())
+        never.update(str(value) for value in raw_never if str(value).strip())
+        task_ids.append(task_id)
+    if not task_ids or str(load_task(task_path).get("id") or "") not in seen:
+        raise ScopeError("requested task is not part of the run task set")
+    return sorted(owns), sorted(never), task_ids
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "task_file",
+        nargs="?",
+        default="",
+        help="task YAML (omit with --write-dirt-baseline)",
+    )
+    ap.add_argument("--cwd", default="")
+    ap.add_argument("--base", default="")
+    ap.add_argument("--uncommitted-only", action="store_true")
+    ap.add_argument(
+        "--run-scope",
+        action="store_true",
+        help="check the union of validated task ownership for a shared run worktree",
+    )
+    ap.add_argument(
+        "--dirt-baseline",
+        default="",
+        help="path to dirt-baseline.json (defaults to artifacts/<task_id>/dirt-baseline.json)",
+    )
+    ap.add_argument(
+        "--write-dirt-baseline",
+        default="",
+        help="write uncommitted dirt snapshot to this path and exit 0",
+    )
+    args = ap.parse_args()
+
+    if args.write_dirt_baseline:
+        cwd = Path(args.cwd or ".").resolve()
+        out = Path(args.write_dirt_baseline).expanduser().resolve()
+        try:
+            files = write_dirt_baseline(cwd, out)
+        except GitCommandError as exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
+            return 2
+        print(f"dirt-baseline: {out} ({len(files)} file(s))")
+        return 0
+
+    if not args.task_file:
+        print("FAIL: task_file is required unless --write-dirt-baseline is set", file=sys.stderr)
+        return 2
+
+    task_path = Path(args.task_file).resolve()
+    data = load_task(task_path)
+    task_id = str(data.get("id") or task_path.stem.split("-")[0])
+    if not SAFE_NAME.fullmatch(task_id) or task_id in {".", ".."}:
+        print(f"FAIL: invalid task id: {task_id!r}", file=sys.stderr)
+        return 2
+    owns = data.get("owns_paths") or data.get("files") or []
+    never = data.get("never_touch") or []
+    if isinstance(owns, str):
+        owns = [owns]
+    if isinstance(never, str):
+        never = [never]
+    owns, never = list(owns or []), list(never or [])
+
+    cwd = Path(args.cwd or data.get("project_cwd") or ".").resolve()
+    scope = "task"
+    scope_task_ids = [task_id]
+    if args.run_scope:
+        try:
+            owns, never, scope_task_ids = run_scope_ownership(task_path, cwd)
+        except ScopeError as exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
+            return 2
+        scope = "run"
+    mode = "git inspection failed"
+    receipt_path = receipt_path_for(task_path, task_id)
+    baseline_path: Path | None
+    if args.dirt_baseline:
+        baseline_path = Path(args.dirt_baseline).expanduser().resolve()
+    elif receipt_path is not None:
+        baseline_path = receipt_path.parent / "dirt-baseline.json"
+    else:
+        baseline_path = None
+    baseline = load_dirt_baseline(baseline_path)
+    try:
+        branch = run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        if args.uncommitted_only or (branch in ("main", "master") and not args.base):
+            mode = f"uncommitted-only on {branch}"
+            changed = uncommitted(cwd)
+        else:
+            base = args.base or main_ref(cwd)
+            mode = f"vs {base}...HEAD + uncommitted on {branch}"
+            changed = branch_changes(cwd, base)
+        print(f"(mode: {mode})")
+        if baseline is not None:
+            print(f"(dirt-baseline: {baseline_path} · {len(baseline)} pre-existing)")
+        sibling = sibling_owns_patterns(task_path, cwd, changed)
+        if sibling:
+            print(f"(sibling-owns: {len(sibling)} pattern(s) from other runs)")
+        details = evaluate_details(
+            changed, owns, never, baseline=baseline, sibling_owns=sibling
+        )
+        exit_code = print_evaluation(details)
+    except GitCommandError as exc:
+        details = {
+            "changed_files": [],
+            "evaluated_files": [],
+            "owns_paths": owns,
+            "never_touch": never,
+            "violations": [],
+            "never_touch_hits": [],
+            "foreign_ignored": [],
+            "sibling_owns": [],
+            "baseline_used": baseline is not None,
+            "status": "failed",
+            "error": str(exc),
+        }
+        exit_code = 2
+        print(f"FAIL: {exc}", file=sys.stderr)
+    if receipt_path is not None:
+        receipt = {
+            "schema_version": 2,
+            "task_id": task_id,
+            "task_sha256": hashlib.sha256(task_path.read_bytes()).hexdigest(),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "cwd": str(cwd),
+            "scope": scope,
+            "scope_task_ids": scope_task_ids,
+            "mode": mode,
+            "dirt_baseline": str(baseline_path) if baseline is not None else None,
+            **details,
+            "exit_code": exit_code,
+        }
+        write_receipt(receipt_path, receipt)
+        print(f"receipt: {receipt_path}")
+    run_dir_candidate = task_path.parent.parent if task_path.parent.name == "tasks" else None
+    record_gate_event(
+        "owns-paths",
+        details.get("status", "failed"),
+        project=str(cwd),
+        run_slug=run_slug_from_run_dir(run_dir_candidate),
+        task_id=task_id,
+        scope=scope,
+        violations=details.get("violations"),
+        never_touch_hits=details.get("never_touch_hits"),
+        exit_code=exit_code,
+        detail=details.get("error"),
+    )
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

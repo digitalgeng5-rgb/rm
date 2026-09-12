@@ -1,0 +1,192 @@
+# Agent hooks / guards — multi-CLI (2026-07)
+
+Deterministic guards that catch agents mid-flight. Shared logic lives in
+`~/.agents/hooks/`; each CLI wires its own config format.
+
+## Shared scripts (`~/.agents/hooks/`)
+
+| Script | When | What |
+|--------|------|------|
+| `guard_shell.py` | PreToolUse (shell + PM edits) | PM read/verify/control-plane allowlist; delegates package, source, process/service/container, and DB mutations; also blocks controller bypass, `--no-verify`, force-push, destructive SQL, and reckless `rm -rf` |
+| `guard_code_quality.py` | PostToolUse (edit) | `any`, Prisma `$queryRawUnsafe`, `@ts-ignore`, eval, hardcoded secrets |
+| `lib_payload.py` | — | Normalize stdin JSON for Claude / Codex / Grok |
+| `pm_stop_sentinel.py` | Stop + PostToolUse `Agent\|Task` (`asyncRewake`) | PM: do not idle while `run-supervisor` is live or a recent controller is terminal/orphan; wake idle PM when stage becomes accepted/blocked/failed |
+
+Set `AGENT_HOOK_CLIENT=claude|codex|grok` so deny payload matches the host.
+
+Escape hatch for code quality: `// guardian: allow <reason>` on the same line.
+
+---
+
+## Claude Code (already rich)
+
+Config: `~/.claude/settings.json` → `hooks`
+
+- PM guard: shared `guard_shell.py` on `Bash|Edit|Write|MultiEdit|NotebookEdit`; installation
+  merges this matcher without replacing user hooks.
+- Shell: shared `guard_shell.py`, lockfile, dangerous-bash, secrets, git-no-verify
+- Post edit: `guardian-code.sh` (local sibling of `guard_code_quality.py`)
+- Trace: `orchestrator-trace.sh`
+
+---
+
+## Codex CLI
+
+| Piece | Path |
+|-------|------|
+| Feature flag | `~/.codex/config.toml` → `[features] hooks = true` |
+| Global hooks | `~/.codex/hooks.json` |
+| Project hooks | `<repo>/.codex/hooks.json` |
+| Shared scripts | `AGENT_HOOK_CLIENT=codex ~/.agents/hooks/guard_*.py` |
+
+**Status:** global hooks wired; `selfystudio/.codex/hooks.json` cleaned of **repowise** (was still calling `repowise-augment`).
+
+Legacy scripts still in `~/.codex/hooks/` (`block-dangerous-shell.py`, handoff-*) — optional; new wiring uses shared Python.
+
+**Trust:** first time may need hook trust (`--dangerously-bypass-hook-trust` only for automation). Restart Codex after editing hooks.json.
+
+Matcher notes: Codex PreToolUse often matches **Bash/shell**; file edits via `apply_patch`.
+
+---
+
+## Grok CLI
+
+| Piece | Path |
+|-------|------|
+| Global hooks | `~/.grok/hooks/*.json` (always trusted) |
+| Project hooks | `<repo>/.grok/hooks/*.json` (needs `/hooks-trust`) |
+| Claude compat | Also reads `~/.claude/settings.json` hooks by default |
+| Docs | `~/.grok/docs/user-guide/10-hooks.md` |
+
+**Installed:** `~/.grok/hooks/agent-guards.json`
+
+Deny format: `{"decision":"deny","reason":"..."}` exit 2. 
+Fail-open on crash/timeout — hooks must return explicit deny.
+
+Matchers map Claude names → Grok (`Bash`→`run_terminal_command`, `Edit`→`search_replace`).
+
+Check UI: `/hooks` after restart.
+
+---
+
+## What each CLI can / cannot block
+
+| Capability | Claude | Codex | Grok |
+|------------|--------|-------|------|
+| Block dangerous shell | ✅ | ✅ | ✅ |
+| Block force-push / no-verify | ✅ | ✅ | ✅ |
+| Post-edit `any` / Prisma unsafe | ✅ (block feedback) | ✅ | soft (message) |
+| PM no production Write | ✅ orchestrator guard | ❌ (not PM host) | ❌ |
+| Fail-open on hook crash | yes | yes | yes |
+
+---
+
+## Adding a new shared guard
+
+1. Add `~/.agents/hooks/guard_foo.py` using `lib_payload`.
+2. Wire into:
+   - Claude: `settings.json` Pre/PostToolUse
+   - Codex: `~/.codex/hooks.json`
+   - Grok: `~/.grok/hooks/*.json`
+3. Keep scripts **fast** (<2–5s). PreToolUse payload errors fail closed;
+   nonblocking PostToolUse quality checks fail open.
+4. Document here.
+
+---
+
+## Community patterns (2026)
+
+- PreToolUse = hard policy; PostToolUse = quality / format ([hooks guides](https://prg.sh/notes/Claude-Code-Hooks))
+- Explicit `deny` JSON — never rely on crash to block
+- AgentGuard / security scanners as optional Pre+Post layer
+- Prefer shared scripts + thin per-CLI wrappers (what we did)
+
+---
+
+## Session ledger (handoff log) — NOT a changelog from safety guards
+
+**Safety guards** (force-push, `any`, …) do **not** write history.
+
+**Session ledger** hooks write project under-the-hood notes after work:
+
+| Path | Purpose |
+|------|---------|
+| `.agents/session-log/INDEX.md` | Newest-first index for night audits |
+| `.agents/session-log/YYYY-MM-DD/*.md` | One **session ledger** / **agent handoff log** per flush |
+| `.agents/agent-notes/OPEN.md` | TODO/FIXME debt found in touched files |
+
+Community names (X / blogs 2026):
+
+- **agent handoff log** — decisions, files, next steps
+- **session ledger / coding journal** — chronological agent work
+- **ADR / decision log** — big architecture choices (promote manually to `docs/decisions.md`)
+- **agent notes** — open debt / simplify later
+
+### How it works
+
+1. **PostToolUse** → `session_ledger.py record` (files + shell samples in `/tmp/...`)
+2. **Stop / SessionEnd** → `session_ledger.py flush` → writes markdown + INDEX
+3. Evidence-based: tools + `git status/diff` — **no invented prose “why”** (that needs model summary or run `report.md`)
+
+### Wired on
+
+| CLI | Config |
+|-----|--------|
+| Claude | `settings.json` PostToolUse + Stop + SessionEnd |
+| Codex | `~/.codex/hooks.json` (+ selfystudio project) |
+| Grok | `~/.grok/hooks/agent-guards.json` |
+
+### Night audit recipe
+
+```bash
+# recent sessions
+head -30 .agents/session-log/INDEX.md
+# open debt
+cat .agents/agent-notes/OPEN.md
+# for each session: verify tests cover touched paths, close OPEN items
+```
+
+### Run reports (lanes)
+
+File-based lanes still write ` .agents/runs/<slug>/artifacts/*/report.md ` with human/agent **why**.
+Session ledger is the automatic cross-CLI layer; run reports are richer for intentional tasks.
+
+## Project memory pack
+
+See [PROJECT-MEMORY.md](./PROJECT-MEMORY.md). Init: `~/.agents/bin/project-memory-init .` 
+Night: `~/.agents/bin/night-audit .` 
+Skill: `project-life`.
+
+## Orchestrator guard (PM allowlist)
+
+Policy lives in `hooks/guard_shell.py` and is installed into
+`~/.claude/settings.json` PreToolUse via `merge_claude_settings.py` on
+`install.sh`. It must stay aligned with SOLO / `dev-orchestrator`:
+
+**PM shell allow**
+- Read/inspect: `cat`, `jq`, `rg`, `git status/diff/log`, docker **logs/ps/inspect**, …
+- Control plane: `run-init`, `run-validate`, `run-board`, `run-finalize`,
+  `resume-project`, `wt-create`, `wt-merge-main`, `lane-stall-check`, `agents-doctor`
+- Delivery: `git add/commit/merge/push` (no `--force` without lease, no `--no-verify`)
+- Verification (L2): `npm|pnpm|yarn test|run typecheck|lint|build|check|verify`,
+  `pytest`, `cargo test`, …
+
+**PM shell deny**
+- `run-controller start|watch|status` (must be `Agent(run-supervisor)`)
+- `lane-ctl` lifecycle (start/accept/verify/…) — use `lane-supervisor`
+- Background / nohup / redirections (`&`, `>`, heredoc writes)
+- Package install/deploy, docker mutate, DB writes, process control, source sed -i
+
+**PM edit allow**
+- `PROGRESS.md`, `LESSONS.md`
+- `.agents/**` text/json/yaml **except** machine receipts:
+  `controller.json`, `controller/`, `artifacts/`, `events.jsonl`, `sessions.json`
+- `docs/plans/**`
+- `/tmp/*` short notes (md/yaml/json/txt)
+
+**Silence protocol:** read receipts with `cat`/`jq` on `controller.json` /
+`events.jsonl` (allowed). Do not invent nohup watchers (denied).
+
+Mid-session policy flips without install are a defect class
+(`orchestrator-guard-midsession-tightening`); pin by not rewriting
+`settings.json` mid-run and always passing `agent_type` on tool payloads.

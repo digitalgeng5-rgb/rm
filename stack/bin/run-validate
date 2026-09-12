@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""Strict read-only validation for Claude Lane Stack run contracts v2."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+try:
+    from gate_log import record_gate_event  # type: ignore
+except Exception:  # pragma: no cover - observability must never break the gate
+    def record_gate_event(*args, **kwargs):  # type: ignore
+        pass
+from verification_safety import (
+    resolve_verification_timeout,
+    verification_error,
+    verification_script_args,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMAS = ROOT / "schemas"
+MAX_VERIFICATION_TIMEOUT = 7200
+GLOB_CHARS = frozenset("*?[")
+
+
+class ContractError(RuntimeError):
+    pass
+
+
+def load_yaml(path: Path, label: str) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ContractError("PyYAML is required for strict run validation") from exc
+    try:
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ContractError(f"cannot read {label} {path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ContractError(f"cannot parse {label} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContractError(f"{label} must contain a YAML mapping: {path}")
+    return value
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ContractError(f"cannot read {label} {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"cannot parse {label} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContractError(f"{label} must contain a JSON object: {path}")
+    return value
+
+
+def load_schema(name: str) -> dict[str, Any]:
+    path = SCHEMAS / name
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ContractError(f"cannot load schema {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContractError(f"schema must contain a JSON object: {path}")
+    return value
+
+
+def configured_verification_executables(run_dir: Path) -> set[str]:
+    policy_path = run_dir.parent.parent / "night-shift.yaml"
+    if not policy_path.is_file():
+        return set()
+    policy = load_yaml(policy_path, "night-shift policy")
+    value = policy.get("verification_executables", [])
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item and "/" not in item for item in value
+    ):
+        raise ContractError("verification_executables must be executable basenames")
+    return set(value)
+
+
+def schema_errors(value: object, schema: dict[str, Any], label: str) -> list[str]:
+    try:
+        import jsonschema
+    except ImportError as exc:
+        raise ContractError("jsonschema is required for strict run validation") from exc
+    validator = jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.FormatChecker()
+    )
+    failures = sorted(
+        validator.iter_errors(value),
+        key=lambda item: ([str(part) for part in item.absolute_path], item.message),
+    )
+    errors = []
+    for failure in failures:
+        location = ".".join(str(part) for part in failure.absolute_path) or "<root>"
+        errors.append(f"{label} schema {location}: {failure.message}")
+    return errors
+
+
+def is_within(path: Path, parent: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def normalize_scope(raw: str) -> str:
+    value = raw.replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    while "//" in value:
+        value = value.replace("//", "/")
+    return value.rstrip("/") or "."
+
+
+def scope_error(raw: str) -> str | None:
+    normalized = normalize_scope(raw)
+    path = PurePosixPath(normalized)
+    if path.is_absolute():
+        return "must be project-relative"
+    if ".." in path.parts:
+        return "must not contain '..'"
+    return None
+
+
+def owns_scope_error(raw: str) -> str | None:
+    detail = scope_error(raw)
+    if detail:
+        return detail
+    first = PurePosixPath(normalize_scope(raw)).parts[:1]
+    if first == (".agents",):
+        return (
+            "must not own .agents (writer sandbox remounts it read-only; "
+            "PM applies playbooks after the writer)"
+        )
+    return None
+
+
+_SPEC_STUB_MARKERS = (
+    "record interfaces, invariants, constraints, and the definition of done here",
+    "replace_me one paragraph",
+    "replace_me stable apis",
+    "replace_me what must keep working",
+    "replace_me explicit non-goals",
+    "replace_me observable acceptance",
+)
+
+_HEAVY_FULL_PACKAGE = re.compile(
+    r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:build|test)(?:\s|$)",
+    re.I,
+)
+
+
+def spec_document_errors(run_dir: Path, run: dict[str, Any], task_count: int) -> list[str]:
+    """Reject template SPEC stubs when the run is non-trivial."""
+    score = run.get("score", 0)
+    try:
+        score_n = int(score)
+    except (TypeError, ValueError):
+        score_n = 0
+    required = score_n >= 7 or task_count >= 2
+    if not required:
+        return []
+    path = run_dir / "SPEC.md"
+    if not path.is_file():
+        return ["SPEC.md is required when score≥7 or the run has ≥2 tasks"]
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [f"SPEC.md cannot be read: {exc}"]
+    lowered = text.lower()
+    for marker in _SPEC_STUB_MARKERS:
+        if marker in lowered:
+            return [
+                "SPEC.md is still a template stub — fill Goal, Interfaces, "
+                "Invariants, Out of scope, and Definition of done (English)"
+            ]
+    # Body after headings must carry substance
+    body = re.sub(r"(?m)^#.*$", "", text).strip()
+    body = re.sub(r"(?m)^Project working directory:.*$", "", body).strip()
+    if len(body) < 160:
+        return [
+            "SPEC.md is too thin for a multi-task or score≥7 run "
+            f"(need substantive English contract, got {len(body)} chars of body)"
+        ]
+    return []
+
+
+def verification_is_heavy_full_package(command: str) -> bool:
+    """True for unscoped package build/test used as L1 on multi-task runs."""
+    cmd = command.strip()
+    if not _HEAVY_FULL_PACKAGE.search(cmd):
+        return False
+    # Path-scoped test runners after -- are focused L1, not full-package green.
+    if " -- " in f" {cmd} " or re.search(r"\s--\s+\S", cmd):
+        return False
+    if re.search(r"(test:unit|vitest|jest).+\.(ts|tsx|js|mjs|cjs|py)\b", cmd, re.I):
+        return False
+    return True
+
+
+def placeholder_locations(value: Any, prefix: str = "") -> list[str]:
+    locations: list[str] = []
+    if isinstance(value, str) and "REPLACE_ME" in value:
+        locations.append(prefix or "<root>")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            locations.extend(placeholder_locations(item, f"{prefix}[{index}]"))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            locations.extend(placeholder_locations(item, child))
+    return locations
+
+
+def literal_prefix(pattern: str) -> str:
+    normalized = normalize_scope(pattern)
+    positions = [normalized.find(char) for char in GLOB_CHARS]
+    positions = [position for position in positions if position >= 0]
+    return normalized[: min(positions)] if positions else normalized
+
+
+def has_glob(pattern: str) -> bool:
+    return any(char in pattern for char in GLOB_CHARS)
+
+
+def tuple_prefix(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    return len(left) <= len(right) and right[: len(left)] == left
+
+
+def scopes_overlap(left: str, right: str) -> bool:
+    """Conservatively decide whether two project-relative scopes may intersect."""
+    left_n = normalize_scope(left)
+    right_n = normalize_scope(right)
+    if not has_glob(left_n) and not has_glob(right_n):
+        left_parts = tuple(left_n.split("/"))
+        right_parts = tuple(right_n.split("/"))
+        return tuple_prefix(left_parts, right_parts) or tuple_prefix(
+            right_parts, left_parts
+        )
+    left_prefix = literal_prefix(left_n)
+    right_prefix = literal_prefix(right_n)
+    if not left_prefix or not right_prefix:
+        return True
+    return left_prefix.startswith(right_prefix) or right_prefix.startswith(left_prefix)
+
+
+def dependency_errors(tasks: dict[str, dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    for task_id, task in tasks.items():
+        for dependency in task["depends_on"]:
+            if dependency not in tasks:
+                errors.append(f"task {task_id}: unknown dependency {dependency!r}")
+
+    state: dict[str, int] = {task_id: 0 for task_id in tasks}
+    stack: list[str] = []
+
+    def visit(task_id: str) -> None:
+        if state[task_id] == 2:
+            return
+        if state[task_id] == 1:
+            start = stack.index(task_id)
+            cycle = stack[start:] + [task_id]
+            errors.append("dependency cycle: " + " -> ".join(cycle))
+            return
+        state[task_id] = 1
+        stack.append(task_id)
+        for dependency in tasks[task_id]["depends_on"]:
+            if dependency in tasks:
+                visit(dependency)
+        stack.pop()
+        state[task_id] = 2
+
+    for task_id in tasks:
+        if state[task_id] == 0:
+            visit(task_id)
+    return errors
+
+
+def validate_acceptances(
+    run_dir: Path,
+    task_files: dict[str, Path],
+    acceptance_schema: dict[str, Any],
+    run_contract: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    for task_id, task_path in task_files.items():
+        acceptance_path = run_dir / "artifacts" / task_id / "acceptance.json"
+        if not acceptance_path.is_file():
+            errors.append(f"task {task_id}: missing {acceptance_path}")
+            continue
+        try:
+            acceptance = load_json(acceptance_path, f"task {task_id} acceptance.json")
+        except ContractError as exc:
+            errors.append(str(exc))
+            continue
+        failures = schema_errors(
+            acceptance, acceptance_schema, f"task {task_id} acceptance.json"
+        )
+        errors.extend(failures)
+        if failures:
+            continue
+        if acceptance["task_id"] != task_id:
+            errors.append(
+                f"task {task_id}: acceptance.json task_id is {acceptance['task_id']!r}"
+            )
+        current_hash = hashlib.sha256(task_path.read_bytes()).hexdigest()
+        if acceptance["task_sha256"] != current_hash:
+            errors.append(f"task {task_id}: acceptance task_sha256 is stale")
+        state_path = run_dir / "artifacts" / task_id / "state.json"
+        if not state_path.is_file():
+            errors.append(f"task {task_id}: missing {state_path}")
+        else:
+            try:
+                state = load_json(state_path, f"task {task_id} state.json")
+            except ContractError as exc:
+                errors.append(str(exc))
+            else:
+                current_attempt = state.get("current_attempt", state.get("attempt"))
+                if current_attempt != acceptance["attempt"]:
+                    errors.append(
+                        f"task {task_id}: acceptance attempt is stale "
+                        f"({acceptance['attempt']} != {current_attempt!r})"
+                    )
+                if state.get("task_sha256") != current_hash:
+                    errors.append(f"task {task_id}: state task_sha256 is stale")
+                if state.get("status") != "accepted" or state.get("accepted") is not True:
+                    errors.append(f"task {task_id}: state is not accepted")
+        task = load_yaml(task_path, f"task {task_id}")
+        if (
+            run_contract.get("gate") == "pre-merge"
+            and str(task.get("risk", "")).lower() in {"high", "critical"}
+            and acceptance["review"] != "passed"
+        ):
+            errors.append(
+                f"task {task_id}: pre-merge gate requires review: passed"
+            )
+    return errors
+
+
+def validate_run(run_dir: Path, phase: str) -> int:
+    if not run_dir.is_dir():
+        raise ContractError(f"run_dir is not a directory: {run_dir}")
+    run_path = run_dir / "run.yaml"
+    run = load_yaml(run_path, "run contract")
+    version = run.get("schema_version", 1)
+    if version != 2:
+        raise ContractError(
+            f"schema v{version} unsupported for strict validation; expected schema v2"
+        )
+
+    run_schema = load_schema("run-v2.schema.json")
+    task_schema = load_schema("task-v2.schema.json")
+    acceptance_schema = load_schema("acceptance-v2.schema.json")
+    errors = schema_errors(run, run_schema, "run.yaml")
+    if errors:
+        raise ContractError("\n".join(errors))
+
+    project_cwd = Path(run["project_cwd"])
+    if not project_cwd.is_absolute():
+        errors.append("run.yaml project_cwd must be absolute")
+    project_cwd = project_cwd.resolve(strict=False)
+    if not project_cwd.is_dir():
+        errors.append(f"run.yaml project_cwd does not exist: {project_cwd}")
+    repo = Path(run["repo"]).resolve(strict=False)
+    if not repo.is_dir():
+        errors.append(f"run.yaml repo does not exist: {repo}")
+    if run["slug"] != run_dir.name:
+        errors.append(
+            f"run.yaml slug {run['slug']!r} does not match directory {run_dir.name!r}"
+        )
+    task_paths = sorted((run_dir / "tasks").glob("*.yaml"))
+    if not task_paths:
+        errors.append("run has no task contracts under tasks/*.yaml")
+    try:
+        verification_executables = configured_verification_executables(run_dir)
+    except ContractError as exc:
+        errors.append(str(exc))
+        verification_executables = set()
+
+    tasks: dict[str, dict[str, Any]] = {}
+    task_files: dict[str, Path] = {}
+    task_entries: list[tuple[str, dict[str, Any]]] = []
+    for task_path in task_paths:
+        try:
+            task = load_yaml(task_path, "task contract")
+        except ContractError as exc:
+            errors.append(str(exc))
+            continue
+        failures = schema_errors(task, task_schema, str(task_path))
+        errors.extend(failures)
+        if failures:
+            continue
+        task_id = task["id"]
+        if task_id in tasks:
+            errors.append(
+                f"duplicate task id {task_id!r}: {task_files[task_id]} and {task_path}"
+            )
+            continue
+        tasks[task_id] = task
+        task_files[task_id] = task_path
+        task_entries.append((task_id, task))
+
+        for location in placeholder_locations(task):
+            errors.append(f"task {task_id}: unresolved placeholder at {location}")
+
+        task_cwd_raw = Path(task["project_cwd"])
+        task_cwd = task_cwd_raw.resolve(strict=False)
+        if not task_cwd_raw.is_absolute():
+            errors.append(f"task {task_id}: project_cwd must be absolute")
+        elif not task_cwd.is_dir():
+            errors.append(f"task {task_id}: project_cwd does not exist: {task_cwd}")
+        elif task_cwd != project_cwd:
+            errors.append(f"task {task_id}: project_cwd must equal run project_cwd")
+
+        # agents-doctor routing.profile.yaml is source of truth for writer lane.
+        try:
+            from routing_profile import (  # type: ignore
+                KNOWN_WRITERS,
+                load_routing_profile,
+                lane_matches_profile,
+            )
+        except ImportError:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from routing_profile import (  # type: ignore
+                KNOWN_WRITERS,
+                load_routing_profile,
+                lane_matches_profile,
+            )
+        routing = load_routing_profile(project_cwd)
+        main_write = (routing.get("lanes") or {}).get("main_write") or (
+            routing.get("writer") or {}
+        ).get("provider")
+        task_lane = str(task.get("lane") or "").strip()
+        if (
+            main_write in KNOWN_WRITERS
+            and task_lane
+            and not lane_matches_profile(task_lane, main_write)
+        ):
+            profile_path = routing.get("_path") or ".agents/routing.profile.yaml"
+            errors.append(
+                f"task {task_id}: lane {task_lane!r} != project main_write "
+                f"{main_write!r} from {profile_path}. "
+                f"Set `lane: {main_write}` (agents-doctor / adoc is source of truth) "
+                f"or re-run `adoc` if the profile is wrong."
+            )
+
+        for field in ("owns_paths", "never_touch"):
+            checker = owns_scope_error if field == "owns_paths" else scope_error
+            for scope in task[field]:
+                detail = checker(scope)
+                if detail:
+                    errors.append(f"task {task_id}: {field} entry {scope!r} {detail}")
+
+        for index, verification in enumerate(task["verification"]):
+            safety_error = verification_error(
+                verification["command"], verification_executables
+            )
+            if safety_error:
+                errors.append(
+                    f"task {task_id}: verification[{index}]: {safety_error}"
+                )
+            cwd_raw = Path(verification["cwd"])
+            if not cwd_raw.is_absolute():
+                errors.append(
+                    f"task {task_id}: verification[{index}].cwd must be absolute"
+                )
+                continue
+            cwd = cwd_raw.resolve(strict=False)
+            if not cwd.is_dir():
+                errors.append(
+                    f"task {task_id}: verification[{index}].cwd does not exist: {cwd}"
+                )
+                continue
+            elif not is_within(cwd, project_cwd):
+                errors.append(
+                    f"task {task_id}: verification[{index}].cwd escapes project_cwd"
+                )
+                continue
+            # timeout_sec optional — control plane defaults to 900 when omitted
+            if "timeout_sec" in verification and verification["timeout_sec"] is not None:
+                timeout = verification["timeout_sec"]
+                try:
+                    timeout_n = int(timeout)
+                except (TypeError, ValueError):
+                    timeout_n = -1
+                if not 1 <= timeout_n <= MAX_VERIFICATION_TIMEOUT:
+                    errors.append(
+                        f"task {task_id}: verification[{index}].timeout_sec must be "
+                        f"1-{MAX_VERIFICATION_TIMEOUT} or omitted (default 900)"
+                    )
+            # Pre-dispatch: every path-like script arg must exist under cwd.
+            # Prevents temples-admin style blocks: worktree cwd + main-only check.py.
+            if phase == "pre-dispatch" and not safety_error:
+                command_text = str(verification.get("command") or "")
+                for script in verification_script_args(command_text):
+                    target = (cwd / script).resolve(strict=False)
+                    if not is_within(target, cwd) and target != cwd:
+                        # should not happen for relative paths without ..
+                        errors.append(
+                            f"task {task_id}: verification[{index}]: script path "
+                            f"escapes verification cwd: {script}"
+                        )
+                        continue
+                    if not target.is_file():
+                        errors.append(
+                            f"task {task_id}: verification[{index}]: script not found "
+                            f"under cwd ({cwd}): {script}. "
+                            f"For worktree runs, copy pre-authored checkers into the "
+                            f"worktree (e.g. "
+                            f".agents/runs/<slug>/artifacts/{task_id}/check.py) "
+                            f"BEFORE dispatch; relative paths resolve from project_cwd, "
+                            f"not the main checkout. Prefer product tests under owns "
+                            f"(tests/...) or in_place workspace when checks live only "
+                            f"on main."
+                        )
+            # L1 heaviness is evaluated after all tasks are known (see below).
+
+    # Multi-task L1 must stay focused. Use final task count (not mid-loop size).
+    if phase == "pre-dispatch" and len(tasks) > 1:
+        score = run.get("score", 0)
+        try:
+            score_n = int(score)
+        except (TypeError, ValueError):
+            score_n = 0
+        for task_id, task in task_entries:
+            for index, verification in enumerate(task["verification"]):
+                command_text = str(verification.get("command") or "")
+                timeout = resolve_verification_timeout(
+                    verification.get("timeout_sec"), command=command_text
+                )
+                heavy = timeout > 900 or verification_is_heavy_full_package(
+                    command_text
+                )
+                if not heavy:
+                    continue
+                msg = (
+                    f"task {task_id}: verification[{index}] looks like an unscoped "
+                    f"full-package build/test (timeout={timeout}) — use focused L1 "
+                    f"paths/suites; full suite is L2 once at pre-merge"
+                )
+                if score_n >= 7:
+                    errors.append(msg)
+                else:
+                    print(f"run-validate: WARN {msg}", file=sys.stderr)
+
+    owners = [
+        (task_id, scope)
+        for task_id, task in task_entries
+        for scope in task["owns_paths"]
+    ]
+    for index, (left_id, left_scope) in enumerate(owners):
+        for right_id, right_scope in owners[index + 1 :]:
+            if left_id != right_id and scopes_overlap(left_scope, right_scope):
+                errors.append(
+                    "owns_paths overlap: "
+                    f"task {left_id} {left_scope!r} and task {right_id} {right_scope!r}"
+                )
+
+    protected = [
+        (task_id, scope)
+        for task_id, task in task_entries
+        for scope in task["never_touch"]
+    ]
+    for owner_id, owner_scope in owners:
+        for protector_id, protected_scope in protected:
+            if scopes_overlap(owner_scope, protected_scope):
+                errors.append(
+                    "never_touch conflict: "
+                    f"task {owner_id} owns {owner_scope!r}, "
+                    f"task {protector_id} protects {protected_scope!r}"
+                )
+
+    errors.extend(dependency_errors(tasks))
+    if phase == "pre-dispatch":
+        errors.extend(spec_document_errors(run_dir, run, len(tasks)))
+        # Plan critique stage (agents-doctor stages.plan_critique).
+        try:
+            from pipeline_stages import (  # type: ignore
+                critique_gate_errors,
+                resolve_plan_critique,
+            )
+        except ImportError:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from pipeline_stages import (  # type: ignore
+                critique_gate_errors,
+                resolve_plan_critique,
+            )
+        try:
+            critique_settings = resolve_plan_critique(project_cwd)
+        except Exception:  # pragma: no cover — never break validate on soft load
+            critique_settings = {"enabled": False}
+        # Auto-run plan critique when enabled and artifact missing so the PM
+        # cannot accidentally skip the stage (structural + optional LLM).
+        if (
+            critique_settings.get("enabled")
+            and not (run_dir / "artifacts" / "critique.json").is_file()
+        ):
+            try:
+                from pipeline_stages import (  # type: ignore
+                    run_full_critique,
+                    write_critique_artifacts,
+                )
+            except ImportError:
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                from pipeline_stages import (  # type: ignore
+                    run_full_critique,
+                    write_critique_artifacts,
+                )
+            try:
+                print(
+                    "run-validate: plan_critique enabled — running plan-critique "
+                    f"for {run_dir} …",
+                    file=sys.stderr,
+                )
+                crit = run_full_critique(
+                    run_dir,
+                    settings=critique_settings,
+                    timeout=int(
+                        __import__("os").environ.get("PLAN_CRITIQUE_TIMEOUT", "1800")
+                    ),
+                    invoke_llm=bool(critique_settings.get("profile_path")),
+                )
+                write_critique_artifacts(
+                    run_dir,
+                    crit,
+                    recommended_provider=str(
+                        critique_settings.get("provider") or "structural"
+                    ),
+                    recommended_model=str(critique_settings.get("model") or ""),
+                )
+                inbox_n = sum(
+                    1
+                    for item in (crit.get("findings") or [])
+                    if isinstance(item, dict) and item.get("severity") in {"error", "warn"}
+                )
+                print(
+                    "run-validate: plan_critique "
+                    f"decision={crit.get('decision')} status={crit.get('status')} "
+                    f"llm={(crit.get('llm_pass') or {}).get('status')} "
+                    f"inbox={inbox_n}",
+                    file=sys.stderr,
+                )
+            except Exception as crit_exc:  # noqa: BLE001
+                print(
+                    f"run-validate: WARN plan_critique auto-run failed: {crit_exc}",
+                    file=sys.stderr,
+                )
+        gate_errs = critique_gate_errors(run_dir, critique_settings)
+        errors.extend(gate_errs)
+        # Surface decision for the orchestrator even on advisory soft path
+        try:
+            from pipeline_stages import load_critique  # type: ignore
+
+            crit_loaded = load_critique(run_dir)
+            if crit_loaded:
+                decision = crit_loaded.get("decision")
+                if decision and decision != "ship":
+                    print(
+                        f"run-validate: plan_critique decision={decision} — "
+                        f"{crit_loaded.get('pm_action')}",
+                        file=sys.stderr,
+                    )
+                if (
+                    str(critique_settings.get("mode") or "advisory") == "advisory"
+                    and decision == "revise_required"
+                ):
+                    print(
+                        "run-validate: WARN decision=revise_required under advisory "
+                        "mode — PM must fix plan or consciously override before "
+                        "dispatch",
+                        file=sys.stderr,
+                    )
+        except Exception:  # pragma: no cover
+            pass
+        if (
+            critique_settings.get("enabled")
+            and str(critique_settings.get("mode") or "advisory") == "advisory"
+            and not (run_dir / "artifacts" / "critique.json").is_file()
+        ):
+            print(
+                "run-validate: WARN plan_critique enabled (advisory) but "
+                "artifacts/critique.json still missing after auto-run — fix "
+                f"`plan-critique --run-dir {run_dir}` before dispatch",
+                file=sys.stderr,
+            )
+    if phase == "pre-merge":
+        errors.extend(
+            validate_acceptances(
+                run_dir, task_files, acceptance_schema, run_contract=run
+            )
+        )
+
+    if errors:
+        raise ContractError("\n".join(dict.fromkeys(errors)))
+    print(f"run-validate: valid {phase} tasks={len(tasks)} run_dir={run_dir}")
+    if phase == "pre-dispatch":
+        try:
+            from usage_ledger import record_critique_dispatch
+
+            record_critique_dispatch(run_dir)
+        except Exception:
+            pass
+    if phase == "pre-merge" and len(tasks) > 1:
+        print(
+            "run-validate: L2 reminder — run one focused full/affected suite for the "
+            "whole run (or CI) before ship; per-task verification is L1 only"
+        )
+    return 0
+
+
+def best_effort_project_cwd(run_dir: Path) -> str | None:
+    try:
+        text = (run_dir / "run.yaml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"^project_cwd:\s*[\"']?([^\"'\n]+)", text, re.M)
+    return match.group(1).strip() if match else None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="strictly validate a lane run v2")
+    parser.add_argument("--run-dir", required=True)
+    parser.add_argument(
+        "--phase", required=True, choices=("pre-dispatch", "pre-merge")
+    )
+    args = parser.parse_args()
+    run_dir = Path(args.run_dir).expanduser().resolve(strict=False)
+    project = best_effort_project_cwd(run_dir)
+    try:
+        result = validate_run(run_dir, args.phase)
+    except ContractError as exc:
+        lines = str(exc).splitlines()
+        for line in lines:
+            print(f"run-validate: {line}", file=sys.stderr)
+        record_gate_event(
+            "validate",
+            "rejected",
+            project=project,
+            run_slug=run_dir.name,
+            scope=args.phase,
+            exit_code=2,
+            detail=lines[0] if lines else "contract error",
+        )
+        return 2
+    record_gate_event(
+        "validate",
+        "passed",
+        project=project,
+        run_slug=run_dir.name,
+        scope=args.phase,
+        exit_code=0,
+    )
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

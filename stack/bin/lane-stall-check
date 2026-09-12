@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Find stale heartbeats; mark v2 state or legacy task status when requested."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def parse_status(text: str) -> str:
+    m = re.search(r"^status:\s*[\"']?([\w-]+)", text, re.M)
+    return m.group(1) if m else ""
+
+
+def set_status(text: str, status: str) -> str:
+    if re.search(r"^status:", text, re.M):
+        return re.sub(r"^status:\s*.*$", f"status: {status}", text, count=1, flags=re.M)
+    return f"status: {status}\n" + text
+
+
+def read_state(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_state(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("repo", nargs="?", default=".")
+    ap.add_argument("--minutes", type=float, default=5.0)
+    ap.add_argument("--mark", action="store_true", help="set status: stalled on stale tasks")
+    args = ap.parse_args()
+    repo = Path(args.repo).resolve()
+    runs = repo / ".agents" / "runs"
+    if not runs.is_dir():
+        print("no .agents/runs", file=sys.stderr)
+        return 0
+
+    now = datetime.now(timezone.utc)
+    stale = []
+    for run_dir in sorted(p for p in runs.iterdir() if p.is_dir()):
+        # MERGE.md is the terminal run marker. Historical task cards may retain
+        # a stale running value, but they no longer represent a live process.
+        if (run_dir / "MERGE.md").is_file():
+            continue
+        tasks_dir = run_dir / "tasks"
+        if not tasks_dir.is_dir():
+            continue
+        for task in tasks_dir.glob("*.yaml"):
+            text = task.read_text(encoding="utf-8", errors="replace")
+            contract_v2 = bool(re.search(r"^schema_version:\s*[\"']?2\b", text, re.M))
+            tid_m = re.search(r"^id:\s*[\"']?([\w.-]+)", text, re.M)
+            tid = tid_m.group(1) if tid_m else task.stem.split("-")[0]
+            if not SAFE_NAME.fullmatch(tid) or tid in {".", ".."}:
+                print(f"WARN: skip invalid task id {tid!r} in {task}", file=sys.stderr)
+                continue
+            state_path = run_dir / "artifacts" / tid / "state.json"
+            state = read_state(state_path)
+            st = str(state.get("status") or ("pending" if contract_v2 else parse_status(text)))
+            if st not in ("running", "review", "stalled"):
+                continue
+            hb_path = run_dir / "artifacts" / tid / "heartbeat.json"
+            age_min = None
+            if hb_path.exists():
+                try:
+                    hb = json.loads(hb_path.read_text(encoding="utf-8"))
+                    ts = datetime.fromisoformat(hb["ts"].replace("Z", "+00:00"))
+                    age_min = (now - ts).total_seconds() / 60.0
+                except Exception:
+                    age_min = 9999.0
+            else:
+                # use task mtime as weak signal
+                age_min = (now.timestamp() - task.stat().st_mtime) / 60.0
+
+            if age_min is not None and age_min >= args.minutes and st == "running":
+                stale.append((run_dir.name, tid, age_min, task))
+                if args.mark:
+                    if contract_v2 or state:
+                        lock_path = state_path.parent / ".lifecycle.lock"
+                        lock_path.parent.mkdir(parents=True, exist_ok=True)
+                        with lock_path.open("a+", encoding="utf-8") as lock:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                            current = read_state(state_path)
+                            if str(current.get("status") or "pending") != "running":
+                                continue
+                            current.update(
+                                {
+                                    "schema_version": 2,
+                                    "task_id": tid,
+                                    "status": "stalled",
+                                    "updated_at": now.isoformat(),
+                                    "stall_reason": f"no heartbeat for {age_min:.1f} minutes",
+                                }
+                            )
+                            write_state(state_path, current)
+                    else:
+                        task.write_text(set_status(text, "stalled"), encoding="utf-8")
+
+    if not stale:
+        print("OK: no stalled running tasks")
+        return 0
+
+    print(f"STALE ({len(stale)}) — no heartbeat ≥ {args.minutes} min:")
+    for slug, tid, age, path in stale:
+        print(f"  {slug} task {tid}: ~{age:.1f}m  {path}")
+    print("Re-dispatch or: lane-stall-check . --minutes 5 --mark")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

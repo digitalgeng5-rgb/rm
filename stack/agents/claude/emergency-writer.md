@@ -1,0 +1,1 @@
+../../plugins/lane-stack/agents/emergency-writer.md

@@ -1,0 +1,15 @@
+id: post-gist-pipeline
+module: content-quality
+title: Standard post-GIST gates
+when: "Draft ready"
+mode: any
+steps:
+  - id: humanize
+    action: agent
+    run: "drmax-text-humanization → humanized.md"
+  - id: detect
+    action: agent
+    run: "ai-detect v3.9.4 → detect.md"
+acceptance:
+  - "humanized.md + detect.md exist"
+next_modules: []

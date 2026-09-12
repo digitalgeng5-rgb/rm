@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# Nightly / INIT living docs: docs-web then Luna max fast on stale/stub pages.
+# Does not commit or push. Opt-in: stages.docs.enabled=true
+set -euo pipefail
+# shellcheck disable=SC1091
+. "$(dirname "$0")/lane-cron-path.sh"
+export CLAUDE_LANE_AUTOMATION=1
+
+REPO="${1:-.}"
+ARG2="${2:-}"
+ARG3="${3:-}"
+MODE_ARG=""
+SINCE_ARG=""
+DRY=""
+if [[ "$ARG2" == "lint" ]]; then
+  MODE_ARG="lint"
+elif [[ "$ARG2" == "--dry-run" ]]; then
+  DRY="--dry-run"
+else
+  SINCE_ARG="$ARG2"
+fi
+if [[ "$ARG3" == "--dry-run" ]]; then
+  DRY="--dry-run"
+fi
+REPO="$(cd "$REPO" && pwd)"
+
+is_lane_stack() {
+  [[ -f "$REPO/CLAUDE.md" ]] && grep -q 'Claude Lane Stack' "$REPO/CLAUDE.md" && return 0
+  [[ -f "$REPO/.agents/routing.profile.yaml" ]] && return 0
+  [[ -d "$REPO/.agents/runs" ]] && return 0
+  return 1
+}
+
+if ! is_lane_stack; then
+  echo "SKIP: not a Claude Lane Stack project: $REPO"
+  exit 0
+fi
+
+cd "$REPO"
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "SKIP: not a git repo: $REPO"
+  exit 0
+fi
+
+BIN="$(dirname "$0")"
+docs_rc=0
+python3 - "$REPO" "$SINCE_ARG" "$BIN" "$MODE_ARG" <<'PY' || docs_rc=$?
+import os
+import sys
+from pathlib import Path
+
+for cand in (
+    Path(sys.argv[3]),
+    Path.home() / ".agents" / "bin",
+    Path("/home/ubuntu/.agents/bin"),
+    Path("/home/ubuntu/tools/claude-lane-stack/bin"),
+):
+    if (cand / "pipeline_stages.py").is_file():
+        sys.path.insert(0, str(cand))
+        break
+from datetime import datetime
+from pipeline_stages import resolve_docs
+
+repo = Path(sys.argv[1])
+since_arg = sys.argv[2]
+mode_arg = sys.argv[4]
+settings = resolve_docs(repo)
+enabled = bool(settings.get("enabled"))
+maintain = settings.get("maintain")
+if isinstance(maintain, str):
+    maintain = maintain.strip().lower() in {"1", "true", "yes", "on"}
+since = since_arg or str(settings.get("since") or "yesterday")
+hour = int(settings.get("hour") or 5)
+print(
+    f"docs.provider={settings.get('provider')} model={settings.get('model')} "
+    f"effort={settings.get('reasoning_effort')} "
+    f"tier={settings.get('service_tier')} enabled={enabled} maintain={bool(maintain)} "
+    f"page_cap={settings.get('page_cap')} since={since} hour={hour:02d}:00"
+)
+Path("/tmp/lane-docs-stage.env").write_text(
+    f"PROVIDER={settings.get('provider') or 'codex'}\n"
+    f"MODEL={settings.get('model') or 'gpt-5.6-luna'}\n"
+    f"EFFORT={settings.get('reasoning_effort') or 'max'}\n"
+    f"TIER={settings.get('service_tier') or 'fast'}\n"
+    f"ENABLED={'true' if enabled else 'false'}\n"
+    f"MAINTAIN={'true' if maintain else 'false'}\n"
+    f"PAGE_CAP={int(settings.get('page_cap') or 0)}\n"
+    f"SINCE={since}\n"
+    f"HOUR={hour}\n"
+    f"MODE_ARG={mode_arg}\n",
+    encoding="utf-8",
+)
+if not enabled:
+    sys.exit(2)
+if (
+    mode_arg != "lint"
+    and os.environ.get("DOCS_IF_HOUR") == "1"
+    and datetime.now().hour != hour
+):
+    sys.exit(3)
+PY
+if [[ "$docs_rc" -eq 2 ]]; then
+  echo "SKIP: stages.docs.enabled=false: $REPO"
+  exit 0
+fi
+if [[ "$docs_rc" -eq 3 ]]; then
+  echo "SKIP: stages.docs.hour != now: $REPO"
+  exit 0
+fi
+if [[ "$docs_rc" -ne 0 ]]; then
+  echo "WARN: resolve_docs failed; using luna/max/fast defaults" >&2
+  cat > /tmp/lane-docs-stage.env <<EOF
+PROVIDER=codex
+MODEL=gpt-5.6-luna
+EFFORT=max
+TIER=fast
+ENABLED=true
+MAINTAIN=true
+PAGE_CAP=0
+SINCE=${SINCE_ARG:-yesterday}
+HOUR=5
+MODE_ARG=${MODE_ARG}
+EOF
+fi
+
+# shellcheck disable=SC1091
+source /tmp/lane-docs-stage.env
+
+WEB_BIN="$(dirname "$0")/docs-web"
+[[ -x "$WEB_BIN" ]] || WEB_BIN="${HOME}/.agents/bin/docs-web"
+STALE_BIN="$(dirname "$0")/docs-stale"
+[[ -x "$STALE_BIN" ]] || STALE_BIN="${HOME}/.agents/bin/docs-stale"
+ONBOARD_BIN="$(dirname "$0")/project-onboard"
+[[ -x "$ONBOARD_BIN" ]] || ONBOARD_BIN="${HOME}/.agents/bin/project-onboard"
+
+echo "PROJECT=$REPO SINCE=$SINCE MODE_ARG=${MODE_ARG:-}"
+
+"$WEB_BIN" rebuild "$REPO" || echo "WARN: docs-web failed" >&2
+
+if [[ "${MODE_ARG:-}" != "lint" ]]; then
+  pass_rc=0
+  "$STALE_BIN" "$REPO" --passport-gaps > /tmp/lane-docs-passport.json || pass_rc=$?
+  if [[ "$pass_rc" -eq 0 ]]; then
+    echo "ONBOARD: passport incomplete — filling CLAUDE.md packs, then wiki"
+    python3 -c "import json; print('GAPS', ' '.join(json.load(open('/tmp/lane-docs-passport.json')).get('gaps') or []))" || true
+    if [[ "$DRY" == "--dry-run" ]]; then
+      echo "DRY-RUN: project-onboard $REPO"
+    elif [[ -x "$ONBOARD_BIN" ]]; then
+      ONBOARD_PLAIN=1 "$ONBOARD_BIN" "$REPO" || echo "WARN: project-onboard failed; continuing wiki"
+    else
+      echo "WARN: project-onboard missing; Luna will fill CLAUDE.md stubs"
+    fi
+  fi
+fi
+
+LINT_FILE=$(mktemp -t docs-lint.XXXXXX)
+"$WEB_BIN" lint "$REPO" > "$LINT_FILE" || true
+WEEKDAY="$(date +%u)"
+
+dispatch_luna() {
+  local mode="$1"
+  local spec extra
+  spec=$(mktemp -t docs-maintain.XXXXXX)
+  extra=$(mktemp -t docs-maintain-pages.XXXXXX)
+  python3 - "$REPO" "$STALE_FILE" "$LINT_FILE" "$extra" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+def _load(raw: str) -> dict:
+    path = Path(raw)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+    try:
+        data = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+repo = Path(sys.argv[1])
+stale = _load(sys.argv[2])
+lint = _load(sys.argv[3])
+pages = list(stale.get("stale_docs") or [])
+for err in lint.get("errors") or []:
+    parts = str(err).split(":")
+    if len(parts) >= 2 and (parts[1].startswith("docs/") or parts[1].startswith("apps/")):
+        cand = parts[1]
+        if cand not in pages:
+            pages.append(cand)
+out = Path(sys.argv[4])
+chunks = []
+picked = pages[:40]
+for rel in picked:
+    path = repo / rel
+    if not path.is_file():
+        continue
+    text = path.read_text(encoding="utf-8")
+    if len(text) > 40000:
+        text = text[:40000] + "\n…(truncated)\n"
+    chunks.append(f"### FILE {rel}\n{text}\n")
+out.write_text("\n".join(chunks), encoding="utf-8")
+print(json.dumps({"pages": picked, "daylog": stale.get("daylog") or ""}))
+PY
+  ART="$REPO/.agents/session-log"
+  mkdir -p "$ART"
+  DAY=$(date +%Y-%m-%d)
+  REPORT="$ART/DOCS-$DAY.md"
+  FINAL=$(mktemp -t docs-maintain-out.XXXXXX)
+  INSTR="${HOME}/.agents/codex/instructions/docs-maintain.md"
+  [[ -f "$INSTR" ]] || INSTR="$(dirname "$0")/../agents/codex/instructions/docs-maintain.md"
+  META=$(mktemp -t docs-maintain-meta.XXXXXX)
+  python3 - "$STALE_FILE" > "$META" <<'PY'
+import json
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+data = {}
+if p.is_file():
+    try:
+        data = json.loads(p.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError:
+        data = {}
+if not isinstance(data, dict):
+    data = {}
+print("STALE_DOCS=" + json.dumps(data.get("stale_docs") or [], ensure_ascii=False))
+print("DAYLOG=" + str(data.get("daylog") or ""))
+PY
+  {
+    cat "$INSTR"
+    echo ""
+    echo "PROJECT_CWD=$REPO"
+    echo "SINCE=$SINCE"
+    echo "MODE=$mode"
+    echo "Do not commit or push. Do not edit web: keys. English body. No secrets."
+    echo "STALE_FILE=$STALE_FILE"
+    echo "Fill every path in STALE_DOCS. Do not skip while that list is non-empty."
+    echo "Do not skip a page because status is already active. Thin/active is unfinished."
+    echo "Do not mark status: active until the completeness floor in the instructions is met."
+    echo "Every file:line must exist in the file (wc -l). Invented line numbers fail."
+    cat "$META"
+    if [[ "$mode" == "lint" || "$WEEKDAY" == "7" ]]; then
+      echo "LINT_FILE=$LINT_FILE"
+    fi
+    echo ""
+    echo "## Page texts"
+    cat "$extra"
+  } > "$spec"
+
+  if [[ "$DRY" == "--dry-run" ]]; then
+    echo "DRY-RUN: would dispatch docs-maintainer MODE=$mode"
+    return 0
+  fi
+  if [[ "${MAINTAIN:-true}" != "true" ]]; then
+    echo "SKIP: stages.docs.maintain=false (web+stale only)"
+    return 0
+  fi
+  if [[ "${PROVIDER}" != "codex" ]]; then
+    echo "NOTE: LLM refresh implemented for codex (provider=$PROVIDER)"
+    return 0
+  fi
+  if ! command -v codex >/dev/null 2>&1; then
+    echo "ERROR: codex CLI required for docs-maintain" >&2
+    return 1
+  fi
+
+  CODEX_CMD=(
+    codex exec
+    --ignore-user-config
+    --model "${MODEL}"
+    -c "model_reasoning_effort=${EFFORT}"
+    -c approval_policy="never"
+    --sandbox danger-full-access
+    --skip-git-repo-check
+    --cd "$REPO"
+    --output-last-message "$FINAL"
+  )
+  if [[ "${TIER:-standard}" == "fast" ]]; then
+    CODEX_CMD+=(-c 'service_tier="fast"' --enable fast_mode)
+  else
+    CODEX_CMD+=(--disable fast_mode)
+  fi
+  LANE_EXEC="${HOME}/.agents/bin/lane-exec"
+  [[ -x "$LANE_EXEC" ]] || LANE_EXEC="$(dirname "$0")/lane-exec"
+  if [[ -x "$LANE_EXEC" ]]; then
+    echo "docs-luna: idle=${DOCS_IDLE:-1200}s max=${DOCS_TIMEOUT:-0}s (0=no wall cap)"
+    "$LANE_EXEC" --idle "${DOCS_IDLE:-1200}" --max "${DOCS_TIMEOUT:-0}" --label docs-luna -- \
+      "${CODEX_CMD[@]}" - < "$spec" || true
+  else
+    "${CODEX_CMD[@]}" - < "$spec" || true
+  fi
+
+  {
+    echo "# DOCS maintain $DAY"
+    echo "repo: $REPO"
+    echo "mode: $mode"
+    echo "since: $SINCE"
+    echo "model: ${MODEL} effort=${EFFORT} tier=${TIER} page_cap=${PAGE_CAP}"
+    echo "commit: no"
+    echo ""
+    cat "$FINAL" 2>/dev/null || echo "(no codex output)"
+  } > "$REPORT"
+  echo "WROTE $REPORT"
+}
+
+if [[ "${MODE_ARG:-}" == "lint" ]]; then
+  STALE_FILE=$(mktemp -t docs-stale-out.XXXXXX)
+  printf '%s\n' '{}' > "$STALE_FILE"
+  dispatch_luna lint
+  "$WEB_BIN" log "$REPO" --kind lint --subject weekly --extra "model: ${MODEL}" || true
+  exit 0
+fi
+
+STALE_FILE=$(mktemp -t docs-stale-out.XXXXXX)
+stale_rc=0
+"$STALE_BIN" "$REPO" --since "$SINCE" --page-cap "$PAGE_CAP" --write-daylog > "$STALE_FILE" || stale_rc=$?
+if [[ "$stale_rc" -eq 2 ]]; then
+  echo "SKIP: no stale pages"
+  "$WEB_BIN" log "$REPO" --kind skip --subject "$SINCE" --extra "reason: no stale pages" || true
+  if [[ "$WEEKDAY" == "7" ]]; then
+    dispatch_luna lint
+  fi
+  exit 0
+fi
+if [[ "$stale_rc" -ne 0 ]]; then
+  echo "WARN: docs-stale failed ($stale_rc)" >&2
+  printf '%s\n' '{}' > "$STALE_FILE"
+fi
+
+python3 - "$STALE_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8") or "{}")
+pages = d.get("stale_docs") or []
+print(f"STALE status={d.get('status')} pages={len(pages)} changed={len(d.get('changed') or [])}")
+print("PAGES " + " ".join(pages[:40]))
+PY
+echo "Recent:"
+git log --since="$SINCE" --oneline -10 || true
+
+MODE="$(python3 - "$STALE_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8") or "{}")
+hits = d.get("hits") or []
+print("init" if any(isinstance(h, dict) and (h.get("stub") or h.get("thin")) for h in hits) else "night")
+PY
+)"
+
+dispatch_luna "$MODE"
+"$WEB_BIN" rebuild "$REPO" || echo "WARN: docs-web failed after Luna" >&2
+"$WEB_BIN" lint "$REPO" || true
+"$WEB_BIN" log "$REPO" --kind ingest --subject "$SINCE" --extra "model: ${MODEL} ${EFFORT} ${TIER} mode: $MODE" || true
+if [[ "$WEEKDAY" == "7" && "$MODE" != "lint" ]]; then
+  dispatch_luna lint
+  "$WEB_BIN" log "$REPO" --kind lint --subject weekly --extra "model: ${MODEL}" || true
+fi

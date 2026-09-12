@@ -1,0 +1,3834 @@
+#!/usr/bin/env python3
+"""Run a typed writer provider behind the lane control-plane boundary.
+
+AGY, Grok, Qwen, Kimi, Cursor, and Codex use run-scoped warm-session affinity.
+Codex keeps an isolated per-slot CODEX_HOME (host MCP/plugins stay out).
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import IO
+
+
+STATE_VERSION = 1
+HARD_MAX_TASKS = 10
+DEFAULT_MAX_TASKS = 10
+DEFAULT_POOL_SIZE = 5
+HARD_MAX_POOL = 10
+SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+AGY_SANDBOX_PROFILE = "off"
+GROK_SANDBOX_PROFILE = "off"
+QWEN_SANDBOX_PROFILE = "off"
+KIMI_SANDBOX_PROFILE = "off"
+CURSOR_SANDBOX_PROFILE = "off"
+OPENCODE_SANDBOX_PROFILE = "off"
+CODEX_SANDBOX_PROFILE = "workspace-write"
+# Minimal config embedded when profile file is missing (install copies
+# profiles/codex/lane-writer.config.toml → ~/.codex/ and ~/.agents/profiles/).
+DEFAULT_LANE_WRITER_CONFIG = """\
+# Bare Codex lane-writer profile (embedded fallback).
+model = "gpt-5.6-luna"
+model_reasoning_effort = "max"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_search = "disabled"
+personality = "pragmatic"
+suppress_unstable_features_warning = true
+project_doc_max_bytes = 32768
+project_doc_fallback_filenames = ["AGENTS.md", "CLAUDE.md"]
+
+[sandbox_workspace_write]
+network_access = true
+
+[agents]
+max_threads = 1
+max_depth = 1
+
+[features]
+multi_agent = false
+multi_agent_v2 = false
+plugins = false
+plugin_sharing = false
+remote_plugin = false
+memories = false
+apps = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+in_app_browser = false
+computer_use = false
+image_generation = false
+goals = false
+hooks = false
+skill_search = false
+skill_mcp_dependency_install = false
+tool_suggest = false
+tool_call_mcp_elicitation = false
+mentions_v2 = false
+shell_snapshot = false
+workspace_dependencies = false
+guardian_approval = false
+"""
+# Native `codex exec --disable <feature>` set for bare writer (stable flags only).
+# System skills (imagegen, skill-installer, …) are baked into Codex and cannot
+# be fully removed via public CLI; user skills/MCP/plugins are excluded by the
+# ephemeral CODEX_HOME + bwrap mask of host ~/.codex.
+CODEX_DISABLE_FEATURES = (
+    "multi_agent",
+    "multi_agent_v2",
+    "plugins",
+    "plugin_sharing",
+    "remote_plugin",
+    "memories",
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "goals",
+    "hooks",
+    "skill_search",
+    "skill_mcp_dependency_install",
+    "tool_suggest",
+    "tool_call_mcp_elicitation",
+    "mentions_v2",
+    "shell_snapshot",
+    "workspace_dependencies",
+    "guardian_approval",
+)
+RUNTIME_SANDBOX_PROFILE = "bubblewrap-workspace"
+PROTOCOL_FAILURE_EXIT = 65
+MAX_PROVIDER_LOG_BYTES = 1024 * 1024
+MAX_REPORT_SCAN_CHARS = 512 * 1024
+MAX_REPORT_BYTES = 256 * 1024
+MAX_EVENT_NAME = 80
+MAX_FAILURE_EVIDENCE_BYTES = 64 * 1024
+AGY_AGENT = "agy-writer"
+AGY_ALLOWED_TOOLS = frozenset(
+    {
+        "find_by_name",
+        "grep_search",
+        "view_file",
+        "list_dir",
+        "run_command",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "write_to_file",
+        "read_url_content",
+        "search_web",
+    }
+)
+REPORT_BEGIN = "<<<LANE_REPORT:BEGIN>>>"
+REPORT_END = "<<<LANE_REPORT:END>>>"
+
+
+def lane_report_boundary(
+    *,
+    task_id: str,
+    cwd: Path,
+    prompt_file: Path,
+    prompt_sha256: str,
+    leading_newline: bool = True,
+) -> str:
+    """Shared writer boundary. Identity fields are stamped by control plane."""
+    prefix = "\n\n" if leading_newline else ""
+    return (
+        f"{prefix}Lane runtime task boundary (non-negotiable): "
+        f"task_id={task_id}; workspace={cwd.resolve()}; "
+        f"prompt_file={prompt_file.resolve()}; prompt_sha256={prompt_sha256}. "
+        "Treat the raw task YAML as authoritative. Write only paths matched by "
+        "owns_paths, honor never_touch, do not spawn subagents, and do not commit, "
+        "merge, or push. The .agents control plane is read-only to you. "
+        f"Return the canonical report between {REPORT_BEGIN} and {REPORT_END} "
+        "(prefer as the final response; do not write after END). "
+        "The report **must** include a STATUS line that is exactly "
+        "one of: complete, partial, timeout, unavailable. "
+        f"You may include `TASK_ID: {task_id}` for readability. "
+        "**Do not invent PROMPT_SHA256** — the control plane stamps TASK_ID and "
+        "PROMPT_SHA256 deterministically after you finish (wrong digits will not "
+        "fail the lane)."
+    )
+PROVIDER_ENV_KEYS = frozenset(
+    {
+        "ALL_PROXY",
+        "COLORTERM",
+        "HOME",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOGNAME",
+        "NODE_EXTRA_CA_CERTS",
+        "NO_PROXY",
+        "PATH",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TERM",
+        "USER",
+        "XDG_DATA_DIRS",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
+PROVIDER_AUTH_ENV_KEYS = {
+    "agy": frozenset(),
+    "grok": frozenset({"GROK_API_KEY", "XAI_API_KEY"}),
+    "codex": frozenset({"OPENAI_API_KEY"}),
+    "qwen": frozenset(
+        {"BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY"}
+    ),
+    "kimi": frozenset({"KIMI_API_KEY"}),
+    "cursor": frozenset({"CURSOR_API_KEY", "CURSOR_API_ENDPOINT"}),
+    "opencode": frozenset(
+        {
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_DIR",
+        }
+    ),
+}
+# kimi-code exposes thinking effort only through the environment; the lane
+# contract allows low|medium|high while kimi models list low|high|max.
+KIMI_THINKING_EFFORT = {"low": "low", "medium": "high", "high": "high"}
+TEST_PROVIDER_ENV_KEYS = frozenset(
+    {
+        "FAKE_ARGS_LOG",
+        "FAKE_CHILD_PID_FILE",
+        "FAKE_CONTROL_PROBE",
+        "FAKE_CODEX_HOME_LOG",
+        "FAKE_DUPLICATE_REPORT",
+        "FAKE_ERROR_MESSAGE",
+        "FAKE_ENV_LOG",
+        "FAKE_ENV_SCRUB_LOG",
+        "FAKE_EXIT",
+        "FAKE_EFFECTIVE_MODEL",
+        "FAKE_PID_FILE",
+        "FAKE_PROVIDER_KIND",
+        "FAKE_PROVIDER_SECRET_LOG",
+        "FAKE_PULSE",
+        "FAKE_REPORT",
+        "FAKE_REPORT_MODE",
+        "FAKE_REPORT_PROMPT_SHA256",
+        "FAKE_REPORT_TASK_ID",
+        "FAKE_SLEEP",
+        "FAKE_SOCKET_PROBE",
+        "FAKE_SPLIT_REPORT",
+        "FAKE_STDERR",
+        "FAKE_STOP_REASON",
+        "FAKE_STREAM_MODE",
+        "FAKE_TEXT_SIZE",
+        "FAKE_HOST_TMP_PROBE",
+        "FAKE_KIMI_SESSION",
+        "FAKE_CODEX_SESSION",
+        "FAKE_VERSION_TEXT",
+        "FAKE_VERSION_PROBE_LOG",
+        "FAKE_VERSION_WARNING",
+        "UNUSED_REMOVED",
+    }
+)
+VERSION_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])v?(\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]{1,32})?)(?![A-Za-z0-9])"
+)
+RECOGNIZED_STOP_REASONS = frozenset(
+    {"EndTurn", "MaxTurns", "Stop", "Completed", "Cancelled", "Error"}
+)
+# Recognition only controls sanitized diagnostics. Success is deliberately
+# narrower: every provider terminal reason except EndTurn fails closed.
+SUCCESS_STOP_REASONS = frozenset({"EndTurn"})
+TOKEN_FIELDS = {
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+    "cached_input_tokens",
+    "reasoning_output_tokens",
+    "thinking_tokens",
+}
+MODEL_USAGE_FIELDS = {
+    "inputTokens",
+    "cacheReadInputTokens",
+    "outputTokens",
+    "reasoningTokens",
+    "totalTokens",
+    "modelCalls",
+    "costUSD",
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_state(path: Path) -> dict:
+    if not path.exists():
+        return {"version": STATE_VERSION, "sessions": {}, "history": []}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read session state {path}: {exc}") from exc
+    if state.get("version") != STATE_VERSION:
+        raise RuntimeError(
+            f"unsupported session state version {state.get('version')!r} in {path}"
+        )
+    state.setdefault("sessions", {})
+    state.setdefault("history", [])
+    return state
+
+
+def save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def lock_file(path: Path, *, nonblocking: bool = False) -> IO[str] | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+    try:
+        fcntl.flock(handle.fileno(), flags)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def unlock_file(handle: IO[str]) -> None:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
+def runtime_lock_dir(run_dir: Path) -> Path:
+    digest = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:20]
+    configured = os.environ.get("XDG_RUNTIME_DIR")
+    roots = []
+    if configured:
+        roots.append(Path(configured) / "claude-lane-stack")
+    roots.append(Path("/tmp") / f"claude-lane-stack-{os.getuid()}")
+
+    errors: list[str] = []
+    for root in roots:
+        path = root / "session-locks" / digest
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            root.chmod(0o700)
+            path.chmod(0o700)
+            probe = path / f".probe-{os.getpid()}"
+            probe.touch(exist_ok=False)
+            probe.unlink()
+            return path
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+    raise RuntimeError("no writable session lock directory: " + "; ".join(errors))
+
+
+def rotation_reason(record: dict | None, *, cwd: str, model: str, max_tasks: int) -> str | None:
+    if not record:
+        return None
+    if record.get("invalid"):
+        return record.get("invalid_reason") or "invalid"
+    if record.get("status") == "running":
+        return "stale_running"
+    if not record.get("session_id"):
+        return "missing_session_id"
+    if record.get("cwd") != cwd:
+        return "cwd_changed"
+    if record.get("model") != model:
+        return "model_changed"
+    if record.get("sandbox") != RUNTIME_SANDBOX_PROFILE:
+        return "sandbox_changed"
+    success_count = int(record.get("success_count", len(record.get("tasks", []))))
+    if success_count >= max_tasks:
+        return "task_limit"
+    return None
+
+
+@dataclass
+class Lease:
+    key: str
+    slot: int
+    handle: IO[str]
+    record: dict
+    is_new: bool
+
+
+class LaneInterrupted(Exception):
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
+
+
+@dataclass
+class StreamResult:
+    provider_exit_code: int
+    exit_code: int
+    session_id: str | None
+    stop_reason: str | None
+    usage: dict | None
+    model_usage: dict | None
+    num_turns: int | None
+    total_cost_usd: int | float | None
+    total_cost_usd_ticks: int | None
+    cost_is_partial: bool | None
+    usage_is_incomplete: bool | None
+    protocol_error: str | None
+    report_sha256: str | None
+    log_truncated: bool
+    stderr_bytes: int
+    failure_class: str | None
+    failure_retryable: bool
+    fallback_eligible: bool
+    failure_source: str | None
+    failure_evidence_sha256: str | None
+
+
+def acquire_lease(
+    *,
+    run_dir: Path,
+    provider: str,
+    role: str,
+    cwd: str,
+    model: str,
+    task_id: str,
+    pool_size: int,
+    max_tasks: int,
+) -> Lease:
+    state_path = run_dir / "sessions.json"
+    locks_dir = runtime_lock_dir(run_dir)
+    state_lock_path = locks_dir / "state.lock"
+    last_wait_notice = 0.0
+
+    while True:
+        state_lock = lock_file(state_lock_path)
+        assert state_lock is not None
+        state = load_state(state_path)
+        run_identity = str(run_dir.resolve())
+        stored_run = state.get("run_dir")
+        if stored_run is not None and stored_run != run_identity:
+            for old_record in state["sessions"].values():
+                archived = dict(old_record)
+                archived["rotation_reason"] = "run_dir_changed"
+                archived["rotated_at"] = utc_now()
+                state["history"].append(archived)
+            state["sessions"] = {}
+        state["run_dir"] = run_identity
+
+        warm: list[tuple[str, int]] = []
+        cold: list[int] = []
+        for slot in range(pool_size):
+            key = f"{provider}:{role}:{slot}"
+            record = state["sessions"].get(key)
+            if record and rotation_reason(
+                record, cwd=cwd, model=model, max_tasks=max_tasks
+            ) is None:
+                warm.append((record.get("updated_at", ""), slot))
+            else:
+                cold.append(slot)
+        ordered_slots = [slot for _, slot in sorted(warm, reverse=True)] + cold
+
+        selected_handle: IO[str] | None = None
+        selected_slot = -1
+        for slot in ordered_slots:
+            handle = lock_file(
+                locks_dir / f"{provider}-{role}-{slot}.lock", nonblocking=True
+            )
+            if handle is not None:
+                selected_handle = handle
+                selected_slot = slot
+                break
+
+        if selected_handle is None:
+            unlock_file(state_lock)
+            now = time.monotonic()
+            if now - last_wait_notice >= 10:
+                print(
+                    f"LANE_SESSION waiting provider={provider} role={role} "
+                    f"pool={pool_size}",
+                    flush=True,
+                )
+                last_wait_notice = now
+            time.sleep(0.2)
+            continue
+
+        key = f"{provider}:{role}:{selected_slot}"
+        old = state["sessions"].get(key)
+        reason = rotation_reason(old, cwd=cwd, model=model, max_tasks=max_tasks)
+        is_new = old is None or reason is not None
+        if old is not None and reason is not None:
+            archived = dict(old)
+            archived["rotation_reason"] = reason
+            archived["rotated_at"] = utc_now()
+            state["history"].append(archived)
+
+        if is_new:
+            generation = int((old or {}).get("generation", 0)) + 1
+            record = {
+                "provider": provider,
+                "role": role,
+                "slot": selected_slot,
+                "generation": generation,
+                "session_id": str(uuid.uuid4()) if provider == "grok" else None,
+                "cwd": cwd,
+                "model": model,
+                "sandbox": RUNTIME_SANDBOX_PROFILE,
+                "tasks": [],
+                "success_count": 0,
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
+                "status": "starting",
+                "invalid": False,
+            }
+        else:
+            record = dict(old)
+
+        record["status"] = "running"
+        record["current_task"] = task_id
+        record["updated_at"] = utc_now()
+        state["sessions"][key] = record
+        state["defaults"] = {"pool_size": pool_size, "max_tasks": max_tasks}
+        save_state(state_path, state)
+        unlock_file(state_lock)
+        return Lease(key, selected_slot, selected_handle, record, is_new)
+
+
+def validate_agy_agent_definition() -> None:
+    path = Path.home() / ".gemini" / "config" / "agents" / AGY_AGENT / "agent.md"
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise RuntimeError(f"AGY agent definition unavailable: {path}") from error
+    parts = source.split("---", 2)
+    if len(parts) != 3 or parts[0].strip():
+        raise RuntimeError("AGY agent definition has invalid frontmatter")
+    frontmatter = parts[1].splitlines()
+    normalized = {line.strip() for line in frontmatter}
+    if f"name: {AGY_AGENT}" not in normalized:
+        raise RuntimeError("AGY agent definition name mismatch")
+    if "subagent: false" not in normalized:
+        raise RuntimeError("AGY agent definition must disable subagent invocation")
+    tools: list[str] = []
+    in_tools = False
+    for line in frontmatter:
+        if line.strip() == "tools:":
+            in_tools = True
+            continue
+        if not in_tools:
+            continue
+        match = re.fullmatch(r"\s+-\s+([A-Za-z0-9_.-]+)\s*", line)
+        if match:
+            tools.append(match.group(1))
+            continue
+        if line.strip():
+            break
+    if len(tools) != len(AGY_ALLOWED_TOOLS) or set(tools) != AGY_ALLOWED_TOOLS:
+        raise RuntimeError("AGY agent definition tool allowlist mismatch")
+
+
+def _resolve_cursor_model(model: str, *, service_tier: str) -> str:
+    """Local copy of routing_profile.resolve_cursor_model (no import cycle)."""
+    raw = (model or "").strip() or "composer-2.5"
+    tier = str(service_tier or "standard").strip().lower()
+    if tier in {"1", "true", "yes", "on"}:
+        tier = "fast"
+    if tier not in {"standard", "fast"}:
+        tier = "standard"
+    bracket = ""
+    base = raw
+    if raw.endswith("]") and "[" in raw:
+        base, _, inside = raw[:-1].partition("[")
+        base = base.strip()
+        bracket = inside.strip()
+    parts = [p.strip() for p in bracket.split(",") if p.strip()] if bracket else []
+    parts = [p for p in parts if not p.lower().startswith("fast=")]
+    if tier == "fast":
+        if not base.endswith("-fast"):
+            base = f"{base}-fast"
+    elif base.endswith("-fast"):
+        base = base[: -len("-fast")]
+    if parts:
+        return f"{base}[{','.join(parts)}]"
+    return base
+
+
+def _opencode_variant(effort: str | None) -> str:
+    # Pass through catalog names (none/minimal/low/medium/high/xhigh/max).
+    # Empty → omit --variant (model has no variants).
+    return (effort or "").strip().lower()
+
+
+def _resolve_opencode_agent(args: argparse.Namespace) -> str:
+    env = (os.environ.get("LANE_OPENCODE_AGENT") or "").strip()
+    if env:
+        return env
+    for start in (getattr(args, "cwd", None), getattr(args, "run_dir", None)):
+        if not start:
+            continue
+        try:
+            from routing_profile import load_routing_profile
+
+            profile = load_routing_profile(Path(start))
+        except Exception:
+            continue
+        writer = profile.get("writer") if isinstance(profile.get("writer"), dict) else {}
+        stages = profile.get("stages") if isinstance(profile.get("stages"), dict) else {}
+        write = stages.get("write") if isinstance(stages.get("write"), dict) else {}
+        agent = str(write.get("agent") or writer.get("agent") or "").strip()
+        try:
+            from pipeline_stages import resolve_opencode_agent
+
+            return resolve_opencode_agent("write", agent)
+        except Exception:
+            if agent:
+                return agent
+    try:
+        from pipeline_stages import DEFAULT_OPENCODE_WRITE_AGENT
+    except Exception:
+        return "lane-writer"
+    return DEFAULT_OPENCODE_WRITE_AGENT
+
+
+def provider_command(
+    args: argparse.Namespace, lease: Lease, *, prompt_sha256: str
+) -> list[str]:
+    if args.provider == "cursor":
+        binary = args.binary or shutil.which("cursor-agent")
+    else:
+        binary = args.binary or shutil.which(args.provider)
+    if not binary:
+        raise RuntimeError(
+            "cursor-agent binary not found"
+            if args.provider == "cursor"
+            else f"{args.provider} binary not found"
+        )
+    if args.provider == "codex":
+        # Bare lane-writer (native Codex):
+        # - per-slot CODEX_HOME = auth + bare config.toml + empty skills/plugins/rules
+        # - `-p lane-writer` layers the same bare profile by name (also installed
+        #   as ~/.codex/lane-writer.config.toml for human inspection)
+        # - do NOT pass --ignore-user-config (would skip our bare config.toml)
+        # - host ~/.codex is tmpfs-hidden by bwrap so MCP/plugins/user skills stay out
+        # - no --ephemeral: session files must survive so the next task can resume
+        command = [
+            binary,
+            "exec",
+            "--json",
+            "--ignore-rules",
+            "--profile",
+            "lane-writer",
+            "--model",
+            args.model,
+            "-c",
+            f'model_reasoning_effort="{args.reasoning_effort}"',
+            "-c",
+            'approval_policy="never"',
+            "-c",
+            'web_search="disabled"',
+            "--sandbox",
+            CODEX_SANDBOX_PROFILE,
+            "--cd",
+            str(args.cwd),
+            "--skip-git-repo-check",
+        ]
+        # Codex Fast mode (ChatGPT credit speed tier) — independent of effort.
+        # Docs: service_tier="fast" + features.fast_mode=true (~1.5× speed, ~2.5× credits).
+        tier = str(getattr(args, "service_tier", None) or "standard").strip().lower()
+        if getattr(args, "fast_mode", False) or tier in {"1", "true", "yes", "on"}:
+            tier = "fast"
+        if tier == "fast":
+            command.extend(
+                [
+                    "-c",
+                    'service_tier="fast"',
+                    "--enable",
+                    "fast_mode",
+                ]
+            )
+        else:
+            # Explicit off so host defaults (interactive ~/.codex may use fast)
+            # cannot leak into the isolated lane-writer CODEX_HOME.
+            command.extend(["--disable", "fast_mode"])
+        for feature in CODEX_DISABLE_FEATURES:
+            command.extend(["--disable", feature])
+        if not lease.is_new and lease.record.get("session_id"):
+            command.extend(["resume", str(lease.record["session_id"])])
+        command.append("-")
+        return command
+    if args.provider == "grok":
+        command = [
+            binary,
+            "--no-subagents",
+            "--no-auto-update",
+            "--prompt-file",
+            str(args.prompt_file),
+            "--model",
+            args.model,
+            "--reasoning-effort",
+            args.reasoning_effort,
+            "--permission-mode",
+            "bypassPermissions",
+            "--sandbox",
+            GROK_SANDBOX_PROFILE,
+            "--rules",
+            lane_report_boundary(
+                task_id=args.task_id,
+                cwd=args.cwd,
+                prompt_file=args.prompt_file,
+                prompt_sha256=prompt_sha256,
+                leading_newline=False,
+            ),
+            "--output-format",
+            "streaming-json",
+            "--cwd",
+            str(args.cwd),
+        ]
+        session_id = lease.record["session_id"]
+        command[1:1] = (
+            ["--session-id", session_id]
+            if lease.is_new
+            else ["--resume", session_id]
+        )
+        return command
+    if args.provider == "qwen":
+        prompt = args.prompt_file.read_text(encoding="utf-8")
+        boundary = lane_report_boundary(
+            task_id=args.task_id,
+            cwd=args.cwd,
+            prompt_file=args.prompt_file,
+            prompt_sha256=prompt_sha256,
+        )
+        command = [
+            binary,
+            "--yolo",
+            "-p",
+            prompt + boundary + "\n",
+            "--model",
+            args.model,
+            "--output-format",
+            "stream-json",
+        ]
+        if not lease.is_new:
+            command[1:1] = ["--resume", lease.record["session_id"]]
+        return command
+    if args.provider == "kimi":
+        prompt = args.prompt_file.read_text(encoding="utf-8")
+        boundary = lane_report_boundary(
+            task_id=args.task_id,
+            cwd=args.cwd,
+            prompt_file=args.prompt_file,
+            prompt_sha256=prompt_sha256,
+        )
+        # kimi-code rejects --yolo/--auto together with -p; prompt mode already
+        # auto-approves tool calls without asking.
+        command = [
+            binary,
+            "-p",
+            prompt + boundary + "\n",
+            "--model",
+            args.model,
+            "--output-format",
+            "stream-json",
+        ]
+        if not lease.is_new:
+            command[1:1] = ["-r", lease.record["session_id"]]
+        return command
+    if args.provider == "cursor":
+        prompt = args.prompt_file.read_text(encoding="utf-8")
+        boundary = lane_report_boundary(
+            task_id=args.task_id,
+            cwd=args.cwd,
+            prompt_file=args.prompt_file,
+            prompt_sha256=prompt_sha256,
+        )
+        tier = str(getattr(args, "service_tier", None) or "standard").strip().lower()
+        if getattr(args, "fast_mode", False) or tier in {"1", "true", "yes", "on"}:
+            tier = "fast"
+        model = _resolve_cursor_model(args.model, service_tier=tier)
+        # Headless Cursor Agent (docs: -p --force/--yolo --trust).
+        # Prefer cursor-agent binary (not the interactive `agent` wrapper).
+        command = [
+            binary,
+            "-p",
+            "--force",
+            "--trust",
+            "--approve-mcps",
+            "--sandbox",
+            "disabled",
+            "--workspace",
+            str(args.cwd),
+            "--model",
+            model,
+            "--output-format",
+            "stream-json",
+            prompt + boundary + "\n",
+        ]
+        if not lease.is_new and lease.record.get("session_id"):
+            command[1:1] = ["--resume", str(lease.record["session_id"])]
+        return command
+    if args.provider == "opencode":
+        prompt = args.prompt_file.read_text(encoding="utf-8")
+        boundary = lane_report_boundary(
+            task_id=args.task_id,
+            cwd=args.cwd,
+            prompt_file=args.prompt_file,
+            prompt_sha256=prompt_sha256,
+        )
+        command = [
+            binary,
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--dir",
+            str(args.cwd),
+            "--agent",
+            _resolve_opencode_agent(args),
+            "--model",
+            args.model,
+        ]
+        variant = _opencode_variant(args.reasoning_effort)
+        if variant:
+            command.extend(["--variant", variant])
+        command.append("--dangerously-skip-permissions")
+        if not lease.is_new and lease.record.get("session_id"):
+            command.extend(["--session", str(lease.record["session_id"])])
+        command.append(prompt + boundary + "\n")
+        return command
+    if args.provider != "agy":
+        raise RuntimeError(f"unsupported provider {args.provider!r}")
+    validate_agy_agent_definition()
+    from routing_profile import resolve_agy_effort
+
+    args.reasoning_effort = resolve_agy_effort(args.model, args.reasoning_effort)
+    prompt = args.prompt_file.read_text(encoding="utf-8")
+    boundary = lane_report_boundary(
+        task_id=args.task_id,
+        cwd=args.cwd,
+        prompt_file=args.prompt_file,
+        prompt_sha256=prompt_sha256,
+    )
+    command = [
+        binary,
+        "--print",
+        prompt + boundary + "\n",
+        "--agent",
+        AGY_AGENT,
+        "--model",
+        args.model,
+        "--effort",
+        args.reasoning_effort,
+        "--dangerously-skip-permissions",
+        "--sandbox=false",
+        "--output-format",
+        "stream-json",
+        "--print-timeout",
+        args.print_timeout,
+        "--add-dir",
+        str(args.cwd),
+    ]
+    if not lease.is_new:
+        command[1:1] = ["--conversation", lease.record["session_id"]]
+    return command
+
+
+def provider_input(
+    args: argparse.Namespace, *, prompt_sha256: str
+) -> bytes | None:
+    if args.provider != "codex":
+        return None
+    prompt = args.prompt_file.read_text(encoding="utf-8")
+    boundary = lane_report_boundary(
+        task_id=args.task_id,
+        cwd=args.cwd,
+        prompt_file=args.prompt_file,
+        prompt_sha256=prompt_sha256,
+    )
+    return (prompt + boundary + "\n").encode("utf-8")
+
+
+def control_plane_root(run_dir: Path) -> Path:
+    for candidate in (run_dir, *run_dir.parents):
+        if candidate.name == ".agents":
+            return candidate
+    raise RuntimeError(f"run-dir must be inside a .agents control plane: {run_dir}")
+
+
+def provider_environment(
+    provider: str, *, reasoning_effort: str | None = None
+) -> dict[str, str]:
+    allowed = (
+        PROVIDER_ENV_KEYS
+        | PROVIDER_AUTH_ENV_KEYS.get(provider, frozenset())
+        | TEST_PROVIDER_ENV_KEYS
+    )
+    environment = {
+        key: value for key, value in os.environ.items() if key in allowed
+    }
+    environment.update({"CLAUDE_LANE_AUTOMATION": "1", "TMPDIR": "/tmp"})
+    if provider == "agy":
+        environment["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
+    if provider == "grok":
+        environment.update(
+            {
+                "GROK_CLAUDE_HOOKS_ENABLED": "0",
+                "GROK_SUBAGENTS": "0",
+                "GROK_SANDBOX": GROK_SANDBOX_PROFILE,
+            }
+        )
+    if provider == "qwen":
+        environment.update(
+            {
+                "QWEN_CODE_SUPPRESS_YOLO_WARNING": "1",
+                "QWEN_CODE_NO_RELAUNCH": "1",
+            }
+        )
+    if provider == "kimi":
+        environment["KIMI_DISABLE_CRON"] = "1"
+        effort = KIMI_THINKING_EFFORT.get(reasoning_effort or "")
+        if effort:
+            environment["KIMI_MODEL_THINKING_EFFORT"] = effort
+    if provider == "opencode":
+        environment.update(
+            {
+                "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+                "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
+                "OPENCODE_PERMISSION": '{"task":"deny"}',
+            }
+        )
+    return environment
+
+
+def lane_writer_config_text() -> str:
+    """Return bare lane-writer config.toml contents (no MCP/plugins)."""
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parents[1] / "profiles" / "codex" / "lane-writer.config.toml",
+        Path.home() / ".agents" / "profiles" / "codex" / "lane-writer.config.toml",
+        Path.home() / ".codex" / "lane-writer.config.toml",
+    ]
+    for path in candidates:
+        try:
+            if path.is_file():
+                return path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return DEFAULT_LANE_WRITER_CONFIG
+
+
+def prepare_codex_home(
+    provider: str, *, run_dir: Path, key: str, reset: bool
+) -> Path | None:
+    """Build an isolated per-slot CODEX_HOME with auth + bare lane-writer config.
+
+    Host MCP servers, plugins, and user skills live under the real ~/.codex and
+    are never copied here. Bubblewrap also tmpfs-masks ~/.codex at runtime.
+    The slot home is reused across tasks so `codex exec resume` can see the
+    previous thread. Reset on rotation (new lease). Auth is not stored in the
+    run dir — only under a uid-scoped temp path.
+    """
+    if provider != "codex":
+        return None
+    configured = os.environ.get("CODEX_HOME")
+    source_home = (
+        Path(configured).expanduser().resolve()
+        if configured
+        else (Path.home() / ".codex").resolve()
+    )
+    auth_source = source_home / "auth.json"
+    if not auth_source.is_file():
+        raise RuntimeError(f"Codex auth file not found: {auth_source}")
+    digest = hashlib.sha256(str(run_dir.resolve()).encode()).hexdigest()[:16]
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+    scratch = (
+        Path(tempfile.gettempdir())
+        / f"claude-lane-codex-{os.getuid()}"
+        / digest
+        / safe_key
+    )
+    if reset and scratch.exists():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True, exist_ok=True)
+    scratch.chmod(0o700)
+    auth_target = scratch / "auth.json"
+    shutil.copyfile(auth_source, auth_target)
+    auth_target.chmod(0o600)
+    config_text = lane_writer_config_text()
+    # Base config + named profile (native `-p lane-writer`).
+    (scratch / "config.toml").write_text(config_text, encoding="utf-8")
+    (scratch / "lane-writer.config.toml").write_text(config_text, encoding="utf-8")
+    # Empty discovery roots so Codex does not inherit host skill/plugin trees
+    # even if a code path resolves relative to CODEX_HOME.
+    (scratch / "skills").mkdir(exist_ok=True)
+    (scratch / "plugins").mkdir(exist_ok=True)
+    (scratch / "rules").mkdir(exist_ok=True)
+    return scratch
+
+
+def active_pathname_sockets() -> list[Path]:
+    sockets: set[Path] = set()
+    try:
+        lines = Path("/proc/net/unix").read_text(encoding="utf-8").splitlines()[1:]
+    except OSError:
+        return []
+    for line in lines:
+        fields = line.split(maxsplit=7)
+        if len(fields) != 8 or not fields[7].startswith("/"):
+            continue
+        path = Path(fields[7])
+        try:
+            if stat.S_ISSOCK(path.stat(follow_symlinks=False).st_mode):
+                sockets.add(path)
+        except OSError:
+            continue
+    return sorted(sockets, key=str)
+
+
+def resolver_mount_args() -> list[str]:
+    """Keep a /run-backed resolv.conf target readable in the private runtime."""
+    try:
+        resolver_target = Path("/etc/resolv.conf").resolve(strict=True)
+    except OSError:
+        return []
+    runtime_root = Path("/run")
+    if not resolver_target.is_file() or not resolver_target.is_relative_to(
+        runtime_root
+    ):
+        return []
+
+    mounts: list[str] = []
+    parent = runtime_root
+    for part in resolver_target.parent.relative_to(runtime_root).parts:
+        parent /= part
+        mounts.extend(("--dir", str(parent)))
+    mounts.extend(("--ro-bind", str(resolver_target), str(resolver_target)))
+    return mounts
+
+
+def sandbox_provider_command(
+    command: list[str],
+    *,
+    provider: str,
+    run_dir: Path,
+    cwd: Path,
+    home: Path,
+    provider_state_dir: Path | None = None,
+) -> list[str]:
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise RuntimeError(
+            "bubblewrap is required to protect the .agents control plane"
+        )
+    control_root = control_plane_root(run_dir)
+    sandbox_command = list(command)
+    codex_binary: Path | None = None
+    if provider == "codex":
+        try:
+            codex_binary = Path(command[0]).resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(f"cannot resolve Codex binary: {command[0]}") from exc
+        if not codex_binary.is_file():
+            raise RuntimeError(f"Codex binary is not a regular file: {codex_binary}")
+        sandbox_command[0] = "/opt/claude-lane-codex"
+    wrapped = [
+        bwrap,
+        "--die-with-parent",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/run",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/var/tmp",
+    ]
+    wrapped.extend(resolver_mount_args())
+    if provider == "agy":
+        writable_paths = (home / ".gemini" / "antigravity-cli", cwd)
+    elif provider == "grok":
+        writable_paths = (home / ".grok", cwd)
+    elif provider == "qwen":
+        writable_paths = (home / ".qwen", cwd)
+    elif provider == "kimi":
+        writable_paths = (home / ".kimi-code", cwd)
+    elif provider == "cursor":
+        writable_paths = (home / ".cursor", cwd)
+    elif provider == "opencode":
+        writable_paths = (
+            home / ".local" / "share" / "opencode",
+            home / ".config" / "opencode",
+            cwd,
+        )
+    else:
+        writable_paths = tuple(
+            path for path in (cwd, provider_state_dir) if path is not None
+        )
+    for writable in writable_paths:
+        if writable.exists():
+            wrapped.extend(("--bind", str(writable), str(writable)))
+    wrapped.extend(("--ro-bind", str(control_root), str(control_root)))
+    hidden_paths: set[Path] = set()
+    if provider == "agy":
+        hidden_paths.add((home / ".codex").resolve())
+        hidden_paths.add((home / ".grok").resolve())
+        hidden_paths.add((home / ".kimi-code").resolve())
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home:
+            hidden_paths.add(Path(configured_codex_home).expanduser().resolve())
+    elif provider == "grok":
+        hidden_paths.add((home / ".codex").resolve())
+        hidden_paths.add((home / ".gemini").resolve())
+        hidden_paths.add((home / ".kimi-code").resolve())
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home:
+            hidden_paths.add(Path(configured_codex_home).expanduser().resolve())
+    elif provider == "qwen":
+        hidden_paths.add((home / ".codex").resolve())
+        hidden_paths.add((home / ".gemini").resolve())
+        hidden_paths.add((home / ".grok").resolve())
+        hidden_paths.add((home / ".kimi-code").resolve())
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home:
+            hidden_paths.add(Path(configured_codex_home).expanduser().resolve())
+    elif provider == "kimi":
+        hidden_paths.add((home / ".codex").resolve())
+        hidden_paths.add((home / ".gemini").resolve())
+        hidden_paths.add((home / ".grok").resolve())
+        hidden_paths.add((home / ".qwen").resolve())
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home:
+            hidden_paths.add(Path(configured_codex_home).expanduser().resolve())
+    elif provider == "cursor":
+        hidden_paths.add((home / ".codex").resolve())
+        hidden_paths.add((home / ".gemini").resolve())
+        hidden_paths.add((home / ".grok").resolve())
+        hidden_paths.add((home / ".qwen").resolve())
+        hidden_paths.add((home / ".kimi-code").resolve())
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home:
+            hidden_paths.add(Path(configured_codex_home).expanduser().resolve())
+    elif provider == "opencode":
+        hidden_paths.add((home / ".codex").resolve())
+        hidden_paths.add((home / ".gemini").resolve())
+        hidden_paths.add((home / ".grok").resolve())
+        hidden_paths.add((home / ".qwen").resolve())
+        hidden_paths.add((home / ".kimi-code").resolve())
+        hidden_paths.add((home / ".cursor").resolve())
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home:
+            hidden_paths.add(Path(configured_codex_home).expanduser().resolve())
+    elif provider == "codex":
+        hidden_paths.update(
+            {
+                (home / ".codex").resolve(),
+                (home / ".gemini").resolve(),
+                (home / ".grok").resolve(),
+                (home / ".kimi-code").resolve(),
+            }
+        )
+    for hidden in sorted(hidden_paths, key=str):
+        if provider_state_dir is not None and hidden == provider_state_dir:
+            continue
+        if hidden.is_dir():
+            wrapped.extend(("--tmpfs", str(hidden)))
+        elif hidden.exists():
+            wrapped.extend(("--ro-bind", "/dev/null", str(hidden)))
+    for socket_path in active_pathname_sockets():
+        hidden_by_private_tmpfs = any(
+            socket_path.is_relative_to(root)
+            for root in (Path("/run"), Path("/var/run"), Path("/tmp"), Path("/var/tmp"))
+        )
+        exposed_by_writable_bind = any(
+            socket_path.is_relative_to(path) for path in writable_paths
+        )
+        if hidden_by_private_tmpfs and not exposed_by_writable_bind:
+            continue
+        wrapped.extend(("--ro-bind", "/dev/null", str(socket_path)))
+    if codex_binary is not None:
+        wrapped.extend(
+            (
+                "--tmpfs",
+                "/opt",
+                "--ro-bind",
+                str(codex_binary),
+                sandbox_command[0],
+            )
+        )
+    wrapped.extend(("--chdir", str(cwd), "--", *sandbox_command))
+    return wrapped
+
+
+def runtime_attempt(output: Path) -> int | None:
+    parent = output.parent
+    if parent.parent.name != "attempts" or not parent.name.isdigit():
+        return None
+    attempt = int(parent.name)
+    return attempt if attempt >= 1 else None
+
+
+def stamp_lane_report_identity(
+    report: str, *, task_id: str, prompt_sha256: str
+) -> str:
+    """Control-plane identity stamp — TASK_ID + PROMPT_SHA256 are never trusted from the LLM.
+
+    The model only needs to provide STATUS (+ narrative body). Identity fields are
+    known at launch (task_id, hash of prompt.md) and written deterministically so
+    providers cannot fail the lane by mistyping a 64-char hex.
+    """
+    expected = prompt_sha256.lower().strip()
+    status: str | None = None
+    body: list[str] = []
+    for line in report.splitlines():
+        if re.match(r"^TASK_ID:\s*", line, re.I):
+            # Optional soft check: wrong task_id from model is a real identity error
+            m = re.match(r"^TASK_ID:\s*(\S+)\s*$", line, re.I)
+            if m and m.group(1) != task_id:
+                raise ValueError("lane report task_id mismatch")
+            continue
+        if re.match(r"^PROMPT_SHA256:\s*", line, re.I):
+            # Discard whatever the model wrote — control plane stamps truth
+            continue
+        sm = re.match(
+            r"^STATUS:\s*(complete|partial|timeout|unavailable)\s*$",
+            line,
+            re.I,
+        )
+        if sm:
+            if status is None:
+                status = sm.group(1).lower()
+            continue
+        body.append(line)
+    if status is None:
+        raise ValueError("lane report status is missing or invalid")
+    # Drop leading empty lines in body for stable digests
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    header = [
+        f"TASK_ID: {task_id}",
+        f"PROMPT_SHA256: {expected}",
+        f"STATUS: {status}",
+    ]
+    if body:
+        return "\n".join(header) + "\n\n" + "\n".join(body) + "\n"
+    return "\n".join(header) + "\n"
+
+
+def extract_lane_report(
+    response: str,
+    *,
+    task_id: str,
+    prompt_sha256: str,
+    begin_count: int,
+    end_count: int,
+) -> str:
+    if begin_count != 1 or end_count != 1:
+        if begin_count == 0:
+            raise ValueError("lane report is missing")
+        raise ValueError("lane report envelope must appear exactly once")
+    begin = response.rfind(REPORT_BEGIN)
+    content_start = begin + len(REPORT_BEGIN)
+    end = response.find(REPORT_END, content_start)
+    if end < 0:
+        raise ValueError("lane report end marker is missing")
+    # ponytail: Cursor/Grok often append a chatty summary after END; once the
+    # envelope is unique and parseable, ignore the tail (ceiling: if a second
+    # forged report appears in the tail we already require begin_count==1).
+    report = response[content_start:end].strip() + "\n"
+    if "\x00" in report or len(report.encode("utf-8")) > MAX_REPORT_BYTES:
+        raise ValueError("lane report is invalid or too large")
+    # Stamp identity from control plane; model only supplies STATUS + body
+    return stamp_lane_report_identity(
+        report, task_id=task_id, prompt_sha256=prompt_sha256
+    )
+
+
+def validate_report_path(path: Path, *, root: Path) -> None:
+    base = root.resolve(strict=True)
+    absolute = Path(os.path.abspath(path))
+    try:
+        relative = absolute.relative_to(base)
+    except ValueError as exc:
+        raise RuntimeError(f"lane report escapes run directory: {path}") from exc
+    current = base
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(f"refusing symlinked lane report path: {path}")
+
+
+def materialize_lane_report(path: Path, report: str, *, root: Path) -> str:
+    validate_report_path(path, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    validate_report_path(path, root=root)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temp.open("x", encoding="utf-8") as handle:
+            handle.write(report)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+    return hashlib.sha256(report.encode("utf-8")).hexdigest()
+
+
+def terminate_provider(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=3)
+
+
+def safe_scalar(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return value
+
+
+def sanitized_usage(value: object, allowed: set[str]) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    result = {
+        key: scalar
+        for key in allowed
+        if (scalar := safe_scalar(value.get(key))) is not None
+    }
+    try:
+        from usage_ledger import normalize_usage
+
+        mapped = normalize_usage(value) or {}
+    except Exception:
+        mapped = {}
+    for key, scalar in mapped.items():
+        if key in allowed and key not in result and safe_scalar(scalar) is not None:
+            result[key] = scalar
+    return result or None
+
+
+def sanitized_model_usage(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, dict] = {}
+    for model, metrics in list(value.items())[:20]:
+        if not isinstance(model, str) or not SAFE_NAME.fullmatch(model.replace("/", "-")):
+            continue
+        clean = sanitized_usage(metrics, MODEL_USAGE_FIELDS)
+        if clean:
+            result[model] = clean
+    return result or None
+
+
+def provider_version(
+    command: list[str], *, cwd: Path, environment: dict[str, str]
+) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    output = (result.stdout or "")[:4096]
+    if not output:
+        return None
+    match = VERSION_TOKEN.search(output)
+    return match.group(1) if match else None
+
+
+def sanitized_stop_reason(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value if value in RECOGNIZED_STOP_REASONS else "Other"
+
+
+def bounded_evidence_append(buffer: bytearray, data: bytes) -> None:
+    remaining = MAX_FAILURE_EVIDENCE_BYTES - len(buffer)
+    if remaining > 0:
+        buffer.extend(data[:remaining])
+
+
+def classify_agy_failure(
+    evidence: bytes,
+    *,
+    provider_exit_code: int,
+    protocol_error: str | None,
+) -> tuple[str | None, bool, bool, str | None, str | None]:
+    if provider_exit_code == 0:
+        if protocol_error is None:
+            return None, False, False, None, None
+
+    lower = evidence.decode("utf-8", errors="ignore").lower()
+    patterns: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+        (
+            "agy_bootstrap_transient",
+            (
+                "settings fetch failed",
+                "failed to load settings",
+                "settings unavailable",
+                "re-authentication required",
+                "dns error",
+                "temporary failure in name resolution",
+                "failed to lookup address information",
+            ),
+            True,
+        ),
+        (
+            "agy_model_unavailable",
+            ("unknown model", "model not found", "unsupported model", "model unavailable"),
+            True,
+        ),
+        (
+            "agy_quota_exhausted",
+            ("rate limit", "quota", "usage limit", "limit reached", "status 429", " 429 "),
+            True,
+        ),
+        (
+            "agy_auth_unavailable",
+            ("unauthorized", "authentication failed", "login required", "sign in", "invalid token"),
+            True,
+        ),
+        (
+            "agy_region_unavailable",
+            ("region unavailable", "not available in your region", "geo blocked", "status 403"),
+            True,
+        ),
+        (
+            "agy_transport_transient",
+            ("connection reset", "timed out", "timeout", "status 503", "service unavailable"),
+            True,
+        ),
+    )
+    evidence_digest = hashlib.sha256(evidence).hexdigest() if evidence else None
+    for failure_class, signatures, fallback_eligible in patterns:
+        if any(signature in lower for signature in signatures):
+            return failure_class, True, fallback_eligible, "provider", evidence_digest
+    if protocol_error is not None:
+        return "agy_protocol_failure", True, False, "protocol", evidence_digest
+    return "agy_provider_failed", True, False, "exit", evidence_digest
+
+
+def grok_model_matches(requested_model: str, model_usage: dict | None) -> bool:
+    if not model_usage or len(model_usage) != 1:
+        return False
+    effective = next(iter(model_usage))
+    allowed = {requested_model}
+    if requested_model == "grok-4.5":
+        allowed.add("grok-4.5-build")
+    return effective in allowed
+
+
+def classify_grok_failure(
+    evidence: bytes,
+    *,
+    provider_exit_code: int,
+    protocol_error: str | None,
+) -> tuple[str | None, bool, bool, str | None, str | None]:
+    error_event = protocol_error == "provider emitted an error event"
+    if protocol_error is not None and not error_event:
+        failure_class = (
+            "grok_model_mismatch"
+            if protocol_error == "effective model does not match requested model"
+            else "grok_protocol_failure"
+        )
+        return failure_class, True, False, "protocol", None
+    if provider_exit_code == 0 and not error_event:
+        return None, False, False, None, None
+
+    lower = evidence.decode("utf-8", errors="ignore").lower()
+    patterns: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+        (
+            "grok_bootstrap_transient",
+            (
+                "settings fetch failed",
+                "failed to load settings",
+                "settings unavailable",
+                "failed to fetch oidc discovery",
+                "oidc token refresh failed",
+                "re-authentication required",
+                "dns error",
+                "temporary failure in name resolution",
+                "failed to lookup address information",
+            ),
+            True,
+        ),
+        (
+            "grok_model_unavailable",
+            ("unknown model", "model not found", "unsupported model", "model unavailable"),
+            True,
+        ),
+        (
+            "grok_quota_exhausted",
+            ("rate limit", "quota", "usage limit", "limit reached", "status 429", " 429 "),
+            True,
+        ),
+        (
+            "grok_auth_unavailable",
+            ("unauthorized", "authentication failed", "login required", "invalid token"),
+            True,
+        ),
+        (
+            "grok_region_unavailable",
+            ("region unavailable", "not available in your region", "geo blocked", "status 403"),
+            True,
+        ),
+        (
+            "grok_transport_transient",
+            ("connection reset", "timed out", "timeout", "status 503", "service unavailable"),
+            True,
+        ),
+    )
+    evidence_digest = hashlib.sha256(evidence).hexdigest() if evidence else None
+    for failure_class, signatures, fallback_eligible in patterns:
+        if any(signature in lower for signature in signatures):
+            return failure_class, True, fallback_eligible, "provider", evidence_digest
+    if error_event:
+        return "grok_protocol_failure", True, False, "protocol", evidence_digest
+    return "grok_provider_failed", True, False, "exit", evidence_digest
+
+
+def classify_qwen_failure(
+    evidence: bytes,
+    *,
+    provider_exit_code: int,
+    protocol_error: str | None,
+) -> tuple[str | None, bool, bool, str | None, str | None]:
+    error_event = protocol_error == "qwen result reported an error"
+    if protocol_error is not None and not error_event:
+        failure_class = (
+            "qwen_model_mismatch"
+            if protocol_error == "qwen effective model does not match requested model"
+            else "qwen_permission_mode_invalid"
+            if protocol_error == "qwen permission mode is not yolo"
+            else "qwen_protocol_failure"
+        )
+        return failure_class, True, False, "protocol", None
+    if provider_exit_code == 0 and not error_event:
+        return None, False, False, None, None
+
+    lower = evidence.decode("utf-8", errors="ignore").lower()
+    patterns: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+        (
+            "qwen_bootstrap_transient",
+            (
+                "settings fetch failed",
+                "failed to load settings",
+                "settings unavailable",
+                "dns error",
+                "temporary failure in name resolution",
+                "failed to lookup address information",
+                "re-authentication required",
+            ),
+            True,
+        ),
+        (
+            "qwen_model_unavailable",
+            (
+                "unknown model",
+                "model not found",
+                "unsupported model",
+                "model unavailable",
+                "invalid model",
+                "does not exist",
+            ),
+            True,
+        ),
+        (
+            "qwen_quota_exhausted",
+            (
+                "rate limit",
+                "quota",
+                "usage limit",
+                "limit reached",
+                "status 429",
+                " 429 ",
+                "too many requests",
+                "insufficient quota",
+            ),
+            True,
+        ),
+        (
+            "qwen_auth_unavailable",
+            (
+                "unauthorized",
+                "authentication failed",
+                "login required",
+                "invalid token",
+                "invalid api key",
+                "status 401",
+            ),
+            True,
+        ),
+        (
+            "qwen_region_unavailable",
+            (
+                "region unavailable",
+                "not available in your region",
+                "geo blocked",
+                "status 403",
+                "forbidden",
+            ),
+            True,
+        ),
+        (
+            "qwen_transport_transient",
+            (
+                "connection reset",
+                "timed out",
+                "timeout",
+                "status 503",
+                "service unavailable",
+                "status 502",
+                "bad gateway",
+            ),
+            True,
+        ),
+    )
+    evidence_digest = hashlib.sha256(evidence).hexdigest() if evidence else None
+    for failure_class, signatures, fallback_eligible in patterns:
+        if any(signature in lower for signature in signatures):
+            return failure_class, True, fallback_eligible, "provider", evidence_digest
+    if error_event:
+        return "qwen_protocol_failure", True, False, "protocol", evidence_digest
+    return "qwen_provider_failed", True, False, "exit", evidence_digest
+
+
+def classify_kimi_failure(
+    evidence: bytes,
+    *,
+    provider_exit_code: int,
+    protocol_error: str | None,
+) -> tuple[str | None, bool, bool, str | None, str | None]:
+    if protocol_error is not None:
+        failure_class = (
+            "kimi_session_mismatch"
+            if protocol_error == "kimi resumed session_id mismatch"
+            else "kimi_protocol_failure"
+        )
+        return failure_class, True, False, "protocol", None
+    if provider_exit_code == 0:
+        return None, False, False, None, None
+
+    lower = evidence.decode("utf-8", errors="ignore").lower()
+    patterns: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+        (
+            "kimi_bootstrap_transient",
+            (
+                "failed to load config",
+                "config.invalid",
+                "dns error",
+                "temporary failure in name resolution",
+                "failed to lookup address information",
+                "re-authentication required",
+            ),
+            True,
+        ),
+        (
+            "kimi_model_unavailable",
+            (
+                "is not configured in config.toml",
+                "unknown model",
+                "model not found",
+                "unsupported model",
+                "model unavailable",
+                "invalid model",
+            ),
+            True,
+        ),
+        (
+            "kimi_quota_exhausted",
+            (
+                "rate limit",
+                "quota",
+                "usage limit",
+                "limit reached",
+                "status 429",
+                " 429 ",
+                "too many requests",
+                "insufficient quota",
+            ),
+            True,
+        ),
+        (
+            "kimi_auth_unavailable",
+            (
+                "unauthorized",
+                "authentication failed",
+                "login required",
+                "invalid token",
+                "invalid api key",
+                "status 401",
+                "kimi login",
+            ),
+            True,
+        ),
+        (
+            "kimi_region_unavailable",
+            (
+                "region unavailable",
+                "not available in your region",
+                "geo blocked",
+                "status 403",
+                "forbidden",
+            ),
+            True,
+        ),
+        (
+            "kimi_transport_transient",
+            (
+                "connection reset",
+                "timed out",
+                "timeout",
+                "status 503",
+                "service unavailable",
+                "status 502",
+                "bad gateway",
+            ),
+            True,
+        ),
+    )
+    evidence_digest = hashlib.sha256(evidence).hexdigest() if evidence else None
+    for failure_class, signatures, fallback_eligible in patterns:
+        if any(signature in lower for signature in signatures):
+            return failure_class, True, fallback_eligible, "provider", evidence_digest
+    return "kimi_provider_failed", True, False, "exit", evidence_digest
+
+
+def stream_codex_provider(
+    process: subprocess.Popen[bytes],
+    output: IO[bytes],
+    *,
+    expected_session_id: str | None,
+    task_id: str,
+    prompt_sha256: str,
+    report_path: Path,
+    report_root: Path,
+) -> StreamResult:
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    open_fds = {stdout_fd, stderr_fd}
+    pending = b""
+    log_bytes = 0
+    log_truncated = False
+    protocol_error: str | None = None
+    thread_id: str | None = None
+    turn_completed = False
+    response_tail = ""
+    marker_overlap = ""
+    report_begin_count = 0
+    report_end_count = 0
+    report_sha256: str | None = None
+    stderr_bytes = 0
+    usage: dict | None = None
+
+    def write_log(data: bytes) -> None:
+        nonlocal log_bytes, log_truncated
+        remaining = MAX_PROVIDER_LOG_BYTES - log_bytes
+        if remaining <= 0:
+            log_truncated = True
+            return
+        chunk = data[:remaining]
+        output.write(chunk)
+        output.flush()
+        log_bytes += len(chunk)
+        if len(chunk) < len(data):
+            log_truncated = True
+
+    def visible_marker(event_type: str) -> None:
+        marker = f"CODEX_EVENT {event_type}\n".encode("utf-8")
+        sys.stdout.buffer.write(marker)
+        sys.stdout.buffer.flush()
+
+    def set_protocol_error(reason: str, line: bytes = b"") -> None:
+        nonlocal protocol_error
+        if protocol_error is not None:
+            return
+        protocol_error = reason
+        digest = hashlib.sha256(line).hexdigest()[:16]
+        write_log(
+            f"\n[codex protocol error: {reason}; bytes={len(line)}; sha256={digest}]\n".encode(
+                "utf-8"
+            )
+        )
+        visible_marker("protocol-error")
+
+    def process_line(line: bytes) -> None:
+        nonlocal thread_id, turn_completed, response_tail, marker_overlap
+        nonlocal report_begin_count, report_end_count, usage
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            set_protocol_error("malformed json stream", line)
+            return
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            set_protocol_error("event must be an object with a string type", line)
+            return
+        event_type = event["type"]
+        if len(event_type) > MAX_EVENT_NAME or not SAFE_NAME.fullmatch(event_type):
+            set_protocol_error("event type is invalid", line)
+            return
+        if event_type == "thread.started":
+            value = event.get("thread_id")
+            if not isinstance(value, str) or not value:
+                set_protocol_error("codex thread_id is invalid", line)
+                return
+            if expected_session_id and value != expected_session_id:
+                set_protocol_error("codex resumed thread_id mismatch", line)
+                return
+            thread_id = value
+            visible_marker(event_type)
+        elif event_type == "item.completed":
+            item = event.get("item")
+            if not isinstance(item, dict):
+                set_protocol_error("completed item must be an object", line)
+                return
+            if item.get("type") == "agent_message":
+                data = item.get("text")
+                if not isinstance(data, str):
+                    set_protocol_error("agent message text must be a string", line)
+                    return
+                encoded = data.encode("utf-8", errors="replace")
+                response_tail = (response_tail + data)[-MAX_REPORT_SCAN_CHARS:]
+                marker_scan = marker_overlap + data
+                report_begin_count += marker_scan.count(REPORT_BEGIN)
+                report_end_count += marker_scan.count(REPORT_END)
+                overlap_size = max(len(REPORT_BEGIN), len(REPORT_END)) - 1
+                marker_overlap = marker_scan[-overlap_size:]
+                write_log(encoded)
+                sys.stdout.buffer.write(encoded)
+                sys.stdout.buffer.flush()
+            else:
+                write_log(f"\n[codex item: {item.get('type', 'unknown')}]\n".encode())
+                visible_marker(event_type)
+        elif event_type == "turn.completed":
+            if turn_completed:
+                set_protocol_error("duplicate turn.completed event", line)
+                return
+            turn_completed = True
+            usage = sanitized_usage(event.get("usage"), TOKEN_FIELDS)
+            visible_marker(event_type)
+        elif event_type in {"turn.failed", "error"}:
+            set_protocol_error("Codex turn failed", line)
+        else:
+            write_log(f"\n[codex event: {event_type}]\n".encode("utf-8"))
+            visible_marker(event_type)
+
+    def consume(chunk: bytes) -> None:
+        nonlocal pending
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            process_line(line)
+
+    def consume_stderr(chunk: bytes) -> None:
+        nonlocal stderr_bytes
+        stderr_bytes += len(chunk)
+        digest = hashlib.sha256(chunk).hexdigest()[:16]
+        write_log(
+            f"\n[codex stderr: bytes={len(chunk)}; sha256={digest}]\n".encode("utf-8")
+        )
+        visible_marker("stderr")
+
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [], 0.1)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if chunk:
+                consume(chunk) if fd == stdout_fd else consume_stderr(chunk)
+            else:
+                open_fds.discard(fd)
+    if pending:
+        process_line(pending)
+
+    provider_exit_code = process.wait()
+    if provider_exit_code == 0 and protocol_error is None and not turn_completed:
+        protocol_error = "stream ended without turn.completed"
+    if provider_exit_code == 0 and protocol_error is None:
+        try:
+            report = extract_lane_report(
+                response_tail,
+                task_id=task_id,
+                prompt_sha256=prompt_sha256,
+                begin_count=report_begin_count,
+                end_count=report_end_count,
+            )
+            report_sha256 = materialize_lane_report(
+                report_path, report, root=report_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            protocol_error = str(exc)
+    exit_code = (
+        PROTOCOL_FAILURE_EXIT
+        if provider_exit_code == 0 and protocol_error is not None
+        else provider_exit_code
+    )
+    failure_class = None
+    failure_source = None
+    if exit_code != 0:
+        failure_class = (
+            "codex_protocol_failure" if protocol_error else "codex_provider_failed"
+        )
+        failure_source = "protocol" if protocol_error else "exit"
+    return StreamResult(
+        provider_exit_code=provider_exit_code,
+        exit_code=exit_code,
+        session_id=thread_id,
+        stop_reason="TurnCompleted" if turn_completed else None,
+        usage=usage,
+        model_usage=None,
+        num_turns=1 if turn_completed else None,
+        total_cost_usd=None,
+        total_cost_usd_ticks=None,
+        cost_is_partial=None,
+        usage_is_incomplete=None,
+        protocol_error=protocol_error,
+        report_sha256=report_sha256,
+        log_truncated=log_truncated,
+        stderr_bytes=stderr_bytes,
+        failure_class=failure_class,
+        failure_retryable=False,
+        fallback_eligible=False,
+        failure_source=failure_source,
+        failure_evidence_sha256=None,
+    )
+
+
+def stream_agy_provider(
+    process: subprocess.Popen[bytes],
+    output: IO[bytes],
+    *,
+    expected_session_id: str | None,
+    requested_model: str,
+    task_id: str,
+    prompt_sha256: str,
+    report_path: Path,
+    report_root: Path,
+) -> StreamResult:
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    open_fds = {stdout_fd, stderr_fd}
+    pending = b""
+    log_bytes = 0
+    log_truncated = False
+    stderr_bytes = 0
+    failure_evidence = bytearray()
+    conversation_id: str | None = None
+    usage: dict | None = None
+    num_turns: int | None = None
+    response: str | None = None
+    result_status: str | None = None
+    protocol_error: str | None = None
+    saw_result = False
+    total_cost_usd: float | None = None
+
+    def write_log(data: bytes) -> None:
+        nonlocal log_bytes, log_truncated
+        remaining = MAX_PROVIDER_LOG_BYTES - log_bytes
+        if remaining <= 0:
+            log_truncated = True
+            return
+        chunk = data[:remaining]
+        output.write(chunk)
+        output.flush()
+        log_bytes += len(chunk)
+        if len(chunk) < len(data):
+            log_truncated = True
+
+    def set_protocol_error(reason: str, line: bytes = b"") -> None:
+        nonlocal protocol_error
+        if protocol_error is None:
+            protocol_error = reason
+            bounded_evidence_append(failure_evidence, line)
+
+    def process_line(line: bytes) -> None:
+        nonlocal conversation_id, usage, num_turns, response, result_status, saw_result, total_cost_usd
+        if not line.strip():
+            return
+        try:
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            set_protocol_error("malformed AGY stream-json", line)
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("event"), str):
+            set_protocol_error("AGY event must be an object with a string event", line)
+            return
+        event = payload["event"]
+        if len(event) > MAX_EVENT_NAME or not SAFE_NAME.fullmatch(event):
+            set_protocol_error("AGY event name is invalid", line)
+            return
+        if saw_result:
+            set_protocol_error("AGY event received after result", line)
+            return
+        print(f"AGY_EVENT {event}", flush=True)
+        if event == "init":
+            value = payload.get("conversation_id")
+            init = payload.get("init")
+            if not isinstance(value, str) or not value:
+                set_protocol_error("AGY init conversation_id is invalid", line)
+                return
+            if expected_session_id and value != expected_session_id:
+                set_protocol_error("AGY resumed conversation_id mismatch", line)
+                return
+            if not isinstance(init, dict) or init.get("model") != requested_model:
+                set_protocol_error("AGY effective model does not match requested model", line)
+                return
+            if init.get("agent") != AGY_AGENT:
+                set_protocol_error("AGY effective agent does not match requested agent", line)
+                return
+            if init.get("permission_mode") != "always-proceed":
+                set_protocol_error("AGY permission mode is not always-proceed", line)
+                return
+            conversation_id = value
+        elif event == "step_update":
+            step = payload.get("step_update")
+            if isinstance(step, dict) and isinstance(step.get("text_delta"), str):
+                data = step["text_delta"].encode("utf-8", errors="replace")
+                write_log(data)
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+        elif event == "result":
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                set_protocol_error("AGY result payload is invalid", line)
+                return
+            saw_result = True
+            value = result.get("conversation_id")
+            if not isinstance(value, str) or not value or value != conversation_id:
+                set_protocol_error("AGY result conversation_id mismatch", line)
+                return
+            result_status = result.get("status")
+            response = result.get("response")
+            if not isinstance(result_status, str) or not isinstance(response, str):
+                set_protocol_error("AGY result status or response is invalid", line)
+                return
+            turns = result.get("num_turns")
+            if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0:
+                num_turns = turns
+            usage = sanitized_usage(result.get("usage"), TOKEN_FIELDS)
+            if usage is None:
+                usage = sanitized_usage(payload.get("usage"), TOKEN_FIELDS)
+            cost = safe_scalar(result.get("cost"))
+            if cost is None:
+                cost = safe_scalar(payload.get("cost"))
+            if cost is None:
+                cost = safe_scalar(result.get("total_cost_usd"))
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                total_cost_usd = float(cost)
+            error = result.get("error")
+            if isinstance(error, str):
+                bounded_evidence_append(failure_evidence, error.encode("utf-8"))
+
+    def consume_stdout(chunk: bytes) -> None:
+        nonlocal pending
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            process_line(line)
+
+    def consume_stderr(chunk: bytes) -> None:
+        nonlocal stderr_bytes
+        stderr_bytes += len(chunk)
+        bounded_evidence_append(failure_evidence, chunk)
+        digest = hashlib.sha256(chunk).hexdigest()[:16]
+        write_log(
+            f"\n[agy stderr: bytes={len(chunk)}; sha256={digest}]\n".encode("utf-8")
+        )
+        print("AGY_EVENT stderr", flush=True)
+
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [], 0.1)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if chunk:
+                consume_stdout(chunk) if fd == stdout_fd else consume_stderr(chunk)
+            else:
+                open_fds.discard(fd)
+    if pending:
+        process_line(pending)
+
+    provider_exit_code = process.wait()
+    report_sha256: str | None = None
+    if provider_exit_code == 0 and protocol_error is None and not saw_result:
+        protocol_error = "AGY stream ended without result"
+    if provider_exit_code == 0 and protocol_error is None and result_status != "SUCCESS":
+        protocol_error = f"AGY result status is {result_status or 'missing'}"
+    if provider_exit_code == 0 and protocol_error is None:
+        try:
+            assert response is not None
+            report = extract_lane_report(
+                response,
+                task_id=task_id,
+                prompt_sha256=prompt_sha256,
+                begin_count=response.count(REPORT_BEGIN),
+                end_count=response.count(REPORT_END),
+            )
+            report_sha256 = materialize_lane_report(
+                report_path, report, root=report_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            protocol_error = str(exc)
+    exit_code = (
+        PROTOCOL_FAILURE_EXIT
+        if provider_exit_code == 0 and protocol_error is not None
+        else provider_exit_code
+    )
+    failure_class, retryable, fallback_eligible, source, evidence_sha256 = (
+        classify_agy_failure(
+            bytes(failure_evidence),
+            provider_exit_code=provider_exit_code,
+            protocol_error=protocol_error,
+        )
+    )
+    return StreamResult(
+        provider_exit_code=provider_exit_code,
+        exit_code=exit_code,
+        session_id=conversation_id,
+        stop_reason="TurnCompleted" if exit_code == 0 else None,
+        usage=usage,
+        model_usage=None,
+        num_turns=num_turns,
+        total_cost_usd=total_cost_usd,
+        total_cost_usd_ticks=None,
+        cost_is_partial=None,
+        usage_is_incomplete=None,
+        protocol_error=protocol_error,
+        report_sha256=report_sha256,
+        log_truncated=log_truncated,
+        stderr_bytes=stderr_bytes,
+        failure_class=failure_class,
+        failure_retryable=retryable,
+        fallback_eligible=fallback_eligible,
+        failure_source=source,
+        failure_evidence_sha256=evidence_sha256,
+    )
+
+
+def classify_cursor_failure(
+    evidence: bytes,
+    *,
+    provider_exit_code: int,
+    protocol_error: str | None,
+) -> tuple[str | None, bool, bool, str | None, str | None]:
+    error_event = protocol_error == "cursor result reported an error"
+    if protocol_error is not None and not error_event:
+        return "cursor_protocol_failure", True, False, "protocol", None
+    if provider_exit_code == 0 and not error_event:
+        return None, False, False, None, None
+    lower = evidence.decode("utf-8", errors="ignore").lower()
+    if any(
+        needle in lower
+        for needle in (
+            "unauthorized",
+            "authentication",
+            "not logged in",
+            "api key",
+            "cursor_api_key",
+        )
+    ):
+        return "cursor_auth_unavailable", True, True, "provider", None
+    if any(
+        needle in lower
+        for needle in ("rate limit", "quota", "status 429", "too many requests")
+    ):
+        return "cursor_quota_exhausted", True, True, "provider", None
+    if error_event:
+        return "cursor_provider_failed", True, True, "provider", None
+    return "cursor_provider_failed", True, True, "provider", None
+
+
+def stream_cursor_provider(
+    process: subprocess.Popen[bytes],
+    output: IO[bytes],
+    *,
+    expected_session_id: str | None,
+    task_id: str,
+    prompt_sha256: str,
+    report_path: Path,
+    report_root: Path,
+) -> StreamResult:
+    """Parse Cursor Agent --output-format stream-json (system/assistant/result)."""
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    open_fds = {stdout_fd, stderr_fd}
+    pending = b""
+    log_bytes = 0
+    log_truncated = False
+    stderr_bytes = 0
+    failure_evidence = bytearray()
+    conversation_id: str | None = None
+    usage: dict | None = None
+    total_cost_usd: float | None = None
+    num_turns: int | None = None
+    response: str | None = None
+    assistant_text = ""
+    result_subtype: str | None = None
+    result_is_error = False
+    protocol_error: str | None = None
+    saw_result = False
+
+    def write_log(data: bytes) -> None:
+        nonlocal log_bytes, log_truncated
+        remaining = MAX_PROVIDER_LOG_BYTES - log_bytes
+        if remaining <= 0:
+            log_truncated = True
+            return
+        chunk = data[:remaining]
+        output.write(chunk)
+        output.flush()
+        log_bytes += len(chunk)
+        if len(chunk) < len(data):
+            log_truncated = True
+
+    def set_protocol_error(reason: str, line: bytes = b"") -> None:
+        nonlocal protocol_error
+        if protocol_error is None:
+            protocol_error = reason
+            bounded_evidence_append(failure_evidence, line)
+
+    def process_line(line: bytes) -> None:
+        nonlocal conversation_id, usage, num_turns, response, assistant_text
+        nonlocal result_subtype, result_is_error, saw_result, total_cost_usd
+        if not line.strip():
+            return
+        try:
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            set_protocol_error("malformed cursor stream-json", line)
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
+            set_protocol_error("cursor event must be an object with a string type", line)
+            return
+        event_type = payload["type"]
+        if saw_result:
+            set_protocol_error("cursor event received after result", line)
+            return
+        print(f"CURSOR_EVENT {event_type}", flush=True)
+        if event_type == "system":
+            if payload.get("subtype") != "init":
+                return
+            value = payload.get("session_id")
+            if not isinstance(value, str) or not value:
+                set_protocol_error("cursor init session_id is invalid", line)
+                return
+            if expected_session_id and value != expected_session_id:
+                set_protocol_error("cursor resumed session_id mismatch", line)
+                return
+            # Cursor reports display names (e.g. "Composer 2.5") — do not
+            # require exact slug match against --model.
+            conversation_id = value
+        elif event_type == "assistant":
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text:
+                            assistant_text += text
+                            data = text.encode("utf-8", errors="replace")
+                            write_log(data)
+                            sys.stdout.buffer.write(data)
+                            sys.stdout.buffer.flush()
+        elif event_type == "result":
+            saw_result = True
+            subtype = payload.get("subtype")
+            result_subtype = subtype if isinstance(subtype, str) else None
+            result_is_error = bool(payload.get("is_error"))
+            value = payload.get("session_id")
+            if isinstance(value, str) and value:
+                conversation_id = value
+            result_text = payload.get("result")
+            response = result_text if isinstance(result_text, str) else ""
+            if not response and assistant_text:
+                response = assistant_text
+            turns = payload.get("num_turns")
+            if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0:
+                num_turns = turns
+            usage = sanitized_usage(payload.get("usage"), TOKEN_FIELDS) or usage
+            cost = safe_scalar(payload.get("total_cost_usd"))
+            if cost is None and isinstance(payload.get("usage"), dict):
+                cost = safe_scalar(payload["usage"].get("costUSD"))
+            if cost is not None:
+                total_cost_usd = cost
+
+    def consume_stdout(chunk: bytes) -> None:
+        nonlocal pending
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            process_line(line)
+
+    def consume_stderr(chunk: bytes) -> None:
+        nonlocal stderr_bytes
+        stderr_bytes += len(chunk)
+        bounded_evidence_append(failure_evidence, chunk)
+        digest = hashlib.sha256(chunk).hexdigest()[:16]
+        write_log(
+            f"\n[cursor stderr: bytes={len(chunk)}; sha256={digest}]\n".encode("utf-8")
+        )
+        print("CURSOR_EVENT stderr", flush=True)
+
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [], 0.1)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if chunk:
+                consume_stdout(chunk) if fd == stdout_fd else consume_stderr(chunk)
+            else:
+                open_fds.discard(fd)
+    if pending:
+        process_line(pending)
+
+    provider_exit_code = process.wait()
+    report_sha256: str | None = None
+    if provider_exit_code == 0 and protocol_error is None and not saw_result:
+        protocol_error = "cursor stream ended without result"
+    if (
+        provider_exit_code == 0
+        and protocol_error is None
+        and (result_is_error or result_subtype not in {None, "success"})
+    ):
+        protocol_error = "cursor result reported an error"
+    if provider_exit_code == 0 and protocol_error is None:
+        try:
+            assert response is not None
+            report = extract_lane_report(
+                response,
+                task_id=task_id,
+                prompt_sha256=prompt_sha256,
+                begin_count=response.count(REPORT_BEGIN),
+                end_count=response.count(REPORT_END),
+            )
+            report_sha256 = materialize_lane_report(
+                report_path, report, root=report_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            protocol_error = str(exc)
+    exit_code = (
+        PROTOCOL_FAILURE_EXIT
+        if provider_exit_code == 0 and protocol_error is not None
+        else provider_exit_code
+    )
+    failure_class, retryable, fallback_eligible, source, evidence_sha256 = (
+        classify_cursor_failure(
+            bytes(failure_evidence),
+            provider_exit_code=provider_exit_code,
+            protocol_error=protocol_error,
+        )
+    )
+    return StreamResult(
+        provider_exit_code=provider_exit_code,
+        exit_code=exit_code,
+        session_id=conversation_id,
+        stop_reason="TurnCompleted" if exit_code == 0 else None,
+        usage=usage,
+        model_usage=None,
+        num_turns=num_turns,
+        total_cost_usd=total_cost_usd,
+        total_cost_usd_ticks=None,
+        cost_is_partial=None,
+        usage_is_incomplete=None,
+        protocol_error=protocol_error,
+        report_sha256=report_sha256,
+        log_truncated=log_truncated,
+        stderr_bytes=stderr_bytes,
+        failure_class=failure_class,
+        failure_retryable=retryable,
+        fallback_eligible=fallback_eligible,
+        failure_source=source,
+        failure_evidence_sha256=evidence_sha256,
+    )
+
+
+def stream_qwen_provider(
+    process: subprocess.Popen[bytes],
+    output: IO[bytes],
+    *,
+    expected_session_id: str | None,
+    requested_model: str,
+    task_id: str,
+    prompt_sha256: str,
+    report_path: Path,
+    report_root: Path,
+) -> StreamResult:
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    open_fds = {stdout_fd, stderr_fd}
+    pending = b""
+    log_bytes = 0
+    log_truncated = False
+    stderr_bytes = 0
+    failure_evidence = bytearray()
+    conversation_id: str | None = None
+    usage: dict | None = None
+    num_turns: int | None = None
+    response: str | None = None
+    result_subtype: str | None = None
+    result_is_error = False
+    protocol_error: str | None = None
+    saw_result = False
+
+    def write_log(data: bytes) -> None:
+        nonlocal log_bytes, log_truncated
+        remaining = MAX_PROVIDER_LOG_BYTES - log_bytes
+        if remaining <= 0:
+            log_truncated = True
+            return
+        chunk = data[:remaining]
+        output.write(chunk)
+        output.flush()
+        log_bytes += len(chunk)
+        if len(chunk) < len(data):
+            log_truncated = True
+
+    def set_protocol_error(reason: str, line: bytes = b"") -> None:
+        nonlocal protocol_error
+        if protocol_error is None:
+            protocol_error = reason
+            bounded_evidence_append(failure_evidence, line)
+
+    def process_line(line: bytes) -> None:
+        nonlocal conversation_id, usage, num_turns, response
+        nonlocal result_subtype, result_is_error, saw_result
+        if not line.strip():
+            return
+        try:
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            set_protocol_error("malformed qwen stream-json", line)
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
+            set_protocol_error("qwen event must be an object with a string type", line)
+            return
+        event_type = payload["type"]
+        if saw_result:
+            set_protocol_error("qwen event received after result", line)
+            return
+        print(f"QWEN_EVENT {event_type}", flush=True)
+        if event_type == "system":
+            if payload.get("subtype") != "init":
+                return
+            value = payload.get("session_id")
+            if not isinstance(value, str) or not value:
+                set_protocol_error("qwen init session_id is invalid", line)
+                return
+            if expected_session_id and value != expected_session_id:
+                set_protocol_error("qwen resumed session_id mismatch", line)
+                return
+            if requested_model and payload.get("model") != requested_model:
+                set_protocol_error(
+                    "qwen effective model does not match requested model", line
+                )
+                return
+            if payload.get("permission_mode") != "yolo":
+                set_protocol_error("qwen permission mode is not yolo", line)
+                return
+            conversation_id = value
+        elif event_type == "assistant":
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text:
+                            data = text.encode("utf-8", errors="replace")
+                            write_log(data)
+                            sys.stdout.buffer.write(data)
+                            sys.stdout.buffer.flush()
+            if isinstance(message, dict):
+                usage = sanitized_usage(message.get("usage"), TOKEN_FIELDS) or usage
+        elif event_type == "result":
+            saw_result = True
+            subtype = payload.get("subtype")
+            result_subtype = subtype if isinstance(subtype, str) else None
+            result_is_error = bool(payload.get("is_error"))
+            value = payload.get("session_id")
+            if isinstance(value, str) and value:
+                conversation_id = value
+            result_text = payload.get("result")
+            response = result_text if isinstance(result_text, str) else ""
+            turns = payload.get("num_turns")
+            if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0:
+                num_turns = turns
+            usage = sanitized_usage(payload.get("usage"), TOKEN_FIELDS) or usage
+            denials = payload.get("permission_denials")
+            if isinstance(denials, list) and denials:
+                bounded_evidence_append(
+                    failure_evidence,
+                    json.dumps(denials, sort_keys=True).encode("utf-8"),
+                )
+
+    def consume_stdout(chunk: bytes) -> None:
+        nonlocal pending
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            process_line(line)
+
+    def consume_stderr(chunk: bytes) -> None:
+        nonlocal stderr_bytes
+        stderr_bytes += len(chunk)
+        bounded_evidence_append(failure_evidence, chunk)
+        digest = hashlib.sha256(chunk).hexdigest()[:16]
+        write_log(
+            f"\n[qwen stderr: bytes={len(chunk)}; sha256={digest}]\n".encode("utf-8")
+        )
+        print("QWEN_EVENT stderr", flush=True)
+
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [], 0.1)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if chunk:
+                consume_stdout(chunk) if fd == stdout_fd else consume_stderr(chunk)
+            else:
+                open_fds.discard(fd)
+    if pending:
+        process_line(pending)
+
+    provider_exit_code = process.wait()
+    report_sha256: str | None = None
+    if provider_exit_code == 0 and protocol_error is None and not saw_result:
+        protocol_error = "qwen stream ended without result"
+    if (
+        provider_exit_code == 0
+        and protocol_error is None
+        and (result_is_error or result_subtype != "success")
+    ):
+        protocol_error = "qwen result reported an error"
+    if provider_exit_code == 0 and protocol_error is None:
+        try:
+            assert response is not None
+            report = extract_lane_report(
+                response,
+                task_id=task_id,
+                prompt_sha256=prompt_sha256,
+                begin_count=response.count(REPORT_BEGIN),
+                end_count=response.count(REPORT_END),
+            )
+            report_sha256 = materialize_lane_report(
+                report_path, report, root=report_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            protocol_error = str(exc)
+    exit_code = (
+        PROTOCOL_FAILURE_EXIT
+        if provider_exit_code == 0 and protocol_error is not None
+        else provider_exit_code
+    )
+    failure_class, retryable, fallback_eligible, source, evidence_sha256 = (
+        classify_qwen_failure(
+            bytes(failure_evidence),
+            provider_exit_code=provider_exit_code,
+            protocol_error=protocol_error,
+        )
+    )
+    return StreamResult(
+        provider_exit_code=provider_exit_code,
+        exit_code=exit_code,
+        session_id=conversation_id,
+        stop_reason="TurnCompleted" if exit_code == 0 else None,
+        usage=usage,
+        model_usage=None,
+        num_turns=num_turns,
+        total_cost_usd=None,
+        total_cost_usd_ticks=None,
+        cost_is_partial=None,
+        usage_is_incomplete=None,
+        protocol_error=protocol_error,
+        report_sha256=report_sha256,
+        log_truncated=log_truncated,
+        stderr_bytes=stderr_bytes,
+        failure_class=failure_class,
+        failure_retryable=retryable,
+        fallback_eligible=fallback_eligible,
+        failure_source=source,
+        failure_evidence_sha256=evidence_sha256,
+    )
+
+
+def stream_kimi_provider(
+    process: subprocess.Popen[bytes],
+    output: IO[bytes],
+    *,
+    expected_session_id: str | None,
+    task_id: str,
+    prompt_sha256: str,
+    report_path: Path,
+    report_root: Path,
+) -> StreamResult:
+    """Consume kimi-code role-based stream-json.
+
+    kimi emits neither an init event nor a terminal result envelope: the
+    session id arrives last as a meta hint, and there is no effective-model
+    echo, permission-mode echo, or usage payload to verify. Success is
+    therefore exit code 0 plus a canonical report inside the assistant text.
+    """
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    open_fds = {stdout_fd, stderr_fd}
+    pending = b""
+    log_bytes = 0
+    log_truncated = False
+    stderr_bytes = 0
+    failure_evidence = bytearray()
+    session_id: str | None = None
+    text_parts: list[str] = []
+    saw_assistant_text = False
+    protocol_error: str | None = None
+
+    def write_log(data: bytes) -> None:
+        nonlocal log_bytes, log_truncated
+        remaining = MAX_PROVIDER_LOG_BYTES - log_bytes
+        if remaining <= 0:
+            log_truncated = True
+            return
+        chunk = data[:remaining]
+        output.write(chunk)
+        output.flush()
+        log_bytes += len(chunk)
+        if len(chunk) < len(data):
+            log_truncated = True
+
+    def set_protocol_error(reason: str, line: bytes = b"") -> None:
+        nonlocal protocol_error
+        if protocol_error is None:
+            protocol_error = reason
+            bounded_evidence_append(failure_evidence, line)
+
+    def emit_text(text: str) -> None:
+        nonlocal saw_assistant_text
+        if not text:
+            return
+        saw_assistant_text = True
+        text_parts.append(text)
+        data = text.encode("utf-8", errors="replace")
+        write_log(data)
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+    def process_line(line: bytes) -> None:
+        nonlocal session_id
+        if not line.strip():
+            return
+        try:
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            set_protocol_error("malformed kimi stream-json", line)
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("role"), str):
+            set_protocol_error("kimi event must be an object with a string role", line)
+            return
+        role = payload["role"]
+        print(f"KIMI_EVENT {role}", flush=True)
+        if role == "assistant":
+            content = payload.get("content")
+            if isinstance(content, str):
+                emit_text(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        emit_text(block["text"])
+            calls = payload.get("tool_calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    name = function.get("name") if isinstance(function, dict) else None
+                    write_log(
+                        f"\n[kimi tool_call: {name if isinstance(name, str) else 'unknown'}]\n".encode(
+                            "utf-8"
+                        )
+                    )
+        elif role == "meta":
+            if payload.get("type") != "session.resume_hint":
+                return
+            value = payload.get("session_id")
+            if not isinstance(value, str) or not value:
+                set_protocol_error("kimi session id is invalid", line)
+                return
+            if expected_session_id and value != expected_session_id:
+                set_protocol_error("kimi resumed session_id mismatch", line)
+                return
+            session_id = value
+
+    def consume_stdout(chunk: bytes) -> None:
+        nonlocal pending
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            process_line(line)
+
+    def consume_stderr(chunk: bytes) -> None:
+        nonlocal stderr_bytes
+        stderr_bytes += len(chunk)
+        bounded_evidence_append(failure_evidence, chunk)
+        digest = hashlib.sha256(chunk).hexdigest()[:16]
+        write_log(
+            f"\n[kimi stderr: bytes={len(chunk)}; sha256={digest}]\n".encode("utf-8")
+        )
+        print("KIMI_EVENT stderr", flush=True)
+
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [], 0.1)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if chunk:
+                consume_stdout(chunk) if fd == stdout_fd else consume_stderr(chunk)
+            else:
+                open_fds.discard(fd)
+    if pending:
+        process_line(pending)
+
+    provider_exit_code = process.wait()
+    report_sha256: str | None = None
+    if provider_exit_code == 0 and protocol_error is None and not saw_assistant_text:
+        protocol_error = "kimi stream ended without an assistant message"
+    if provider_exit_code == 0 and protocol_error is None:
+        response = "".join(text_parts)
+        try:
+            report = extract_lane_report(
+                response,
+                task_id=task_id,
+                prompt_sha256=prompt_sha256,
+                begin_count=response.count(REPORT_BEGIN),
+                end_count=response.count(REPORT_END),
+            )
+            report_sha256 = materialize_lane_report(
+                report_path, report, root=report_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            protocol_error = str(exc)
+    exit_code = (
+        PROTOCOL_FAILURE_EXIT
+        if provider_exit_code == 0 and protocol_error is not None
+        else provider_exit_code
+    )
+    failure_class, retryable, fallback_eligible, source, evidence_sha256 = (
+        classify_kimi_failure(
+            bytes(failure_evidence),
+            provider_exit_code=provider_exit_code,
+            protocol_error=protocol_error,
+        )
+    )
+    return StreamResult(
+        provider_exit_code=provider_exit_code,
+        exit_code=exit_code,
+        session_id=session_id,
+        stop_reason="TurnCompleted" if exit_code == 0 else None,
+        usage=None,
+        model_usage=None,
+        num_turns=None,
+        total_cost_usd=None,
+        total_cost_usd_ticks=None,
+        cost_is_partial=None,
+        usage_is_incomplete=None,
+        protocol_error=protocol_error,
+        report_sha256=report_sha256,
+        log_truncated=log_truncated,
+        stderr_bytes=stderr_bytes,
+        failure_class=failure_class,
+        failure_retryable=retryable,
+        fallback_eligible=fallback_eligible,
+        failure_source=source,
+        failure_evidence_sha256=evidence_sha256,
+    )
+
+
+def classify_opencode_failure(
+    evidence: bytes,
+    *,
+    provider_exit_code: int,
+    protocol_error: str | None,
+) -> tuple[str | None, bool, bool, str | None, str | None]:
+    if protocol_error is not None:
+        return "opencode_protocol_failure", True, False, "protocol", None
+    if provider_exit_code == 0:
+        return None, False, False, None, None
+    lower = evidence.decode("utf-8", errors="ignore").lower()
+    if any(
+        needle in lower
+        for needle in (
+            "unauthorized",
+            "authentication",
+            "not logged in",
+            "api key",
+            "auth.json",
+        )
+    ):
+        return "opencode_auth_unavailable", True, True, "provider", None
+    if any(
+        needle in lower
+        for needle in ("rate limit", "quota", "status 429", "too many requests")
+    ):
+        return "opencode_quota_exhausted", True, True, "provider", None
+    return "opencode_provider_failed", True, True, "provider", None
+
+
+def stream_opencode_provider(
+    process: subprocess.Popen[bytes],
+    output: IO[bytes],
+    *,
+    expected_session_id: str | None,
+    task_id: str,
+    prompt_sha256: str,
+    report_path: Path,
+    report_root: Path,
+) -> StreamResult:
+    """Parse `opencode run --format json` events (type + sessionID + part)."""
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    open_fds = {stdout_fd, stderr_fd}
+    pending = b""
+    log_bytes = 0
+    log_truncated = False
+    stderr_bytes = 0
+    failure_evidence = bytearray()
+    conversation_id: str | None = None
+    usage: dict | None = None
+    total_cost_usd: float | None = None
+    response = ""
+    protocol_error: str | None = None
+    saw_stop = False
+    saw_error = False
+
+    def write_log(data: bytes) -> None:
+        nonlocal log_bytes, log_truncated
+        remaining = MAX_PROVIDER_LOG_BYTES - log_bytes
+        if remaining <= 0:
+            log_truncated = True
+            return
+        chunk = data[:remaining]
+        output.write(chunk)
+        output.flush()
+        log_bytes += len(chunk)
+        if len(chunk) < len(data):
+            log_truncated = True
+
+    def set_protocol_error(reason: str, line: bytes = b"") -> None:
+        nonlocal protocol_error
+        if protocol_error is None:
+            protocol_error = reason
+            bounded_evidence_append(failure_evidence, line)
+
+    def take_session(payload: dict) -> None:
+        nonlocal conversation_id
+        value = (
+            payload.get("sessionID")
+            or payload.get("sessionId")
+            or payload.get("session_id")
+        )
+        if not isinstance(value, str) or not value:
+            return
+        if expected_session_id and conversation_id is None and value != expected_session_id:
+            set_protocol_error("opencode resumed session_id mismatch")
+            return
+        conversation_id = value
+
+    def process_line(line: bytes) -> None:
+        nonlocal response, saw_stop, saw_error, usage, total_cost_usd
+        if not line.strip():
+            return
+        try:
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            set_protocol_error("malformed opencode json", line)
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
+            set_protocol_error("opencode event must be an object with a string type", line)
+            return
+        event_type = payload["type"]
+        print(f"OPENCODE_EVENT {event_type}", flush=True)
+        take_session(payload)
+        part = payload.get("part") if isinstance(payload.get("part"), dict) else {}
+        text = part.get("text") if isinstance(part, dict) else None
+        if not isinstance(text, str):
+            text = payload.get("text")
+        if isinstance(text, str) and text:
+            response += text
+            data = text.encode("utf-8", errors="replace")
+            write_log(data)
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        if event_type in {"error", "session.error"}:
+            saw_error = True
+            set_protocol_error("opencode result reported an error", line)
+        if event_type in {"step_finish", "step-finish", "finish"}:
+            reason = ""
+            if isinstance(part, dict):
+                reason = str(part.get("reason") or "")
+            if reason in {"", "stop", "end", "complete"}:
+                saw_stop = True
+        chunk, cost, merge = None, 0.0, None
+        try:
+            from usage_ledger import merge_usage, usage_from_event
+
+            chunk, cost = usage_from_event(payload)
+            merge = merge_usage
+        except Exception:
+            chunk = sanitized_usage(payload.get("usage"), TOKEN_FIELDS)
+        if chunk:
+            mapped = sanitized_usage(chunk, TOKEN_FIELDS) or chunk
+            usage = merge(usage, mapped) if merge else mapped
+        if cost:
+            total_cost_usd = (total_cost_usd or 0.0) + cost
+
+    def consume_stdout(chunk: bytes) -> None:
+        nonlocal pending
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            process_line(line)
+
+    def consume_stderr(chunk: bytes) -> None:
+        nonlocal stderr_bytes
+        stderr_bytes += len(chunk)
+        bounded_evidence_append(failure_evidence, chunk)
+        digest = hashlib.sha256(chunk).hexdigest()[:16]
+        write_log(
+            f"\n[opencode stderr: bytes={len(chunk)}; sha256={digest}]\n".encode("utf-8")
+        )
+        print("OPENCODE_EVENT stderr", flush=True)
+
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [], 0.1)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if chunk:
+                consume_stdout(chunk) if fd == stdout_fd else consume_stderr(chunk)
+            else:
+                open_fds.discard(fd)
+    if pending:
+        process_line(pending)
+
+    provider_exit_code = process.wait()
+    if usage is None and conversation_id:
+        try:
+            from usage_ledger import usage_from_opencode_export
+
+            exported, export_cost = usage_from_opencode_export(conversation_id)
+        except Exception:
+            exported, export_cost = None, 0.0
+        if exported:
+            usage = sanitized_usage(exported, TOKEN_FIELDS) or exported
+        if export_cost:
+            total_cost_usd = (total_cost_usd or 0.0) + export_cost
+    report_sha256: str | None = None
+    if (
+        provider_exit_code == 0
+        and protocol_error is None
+        and not saw_stop
+        and REPORT_BEGIN not in response
+    ):
+        protocol_error = "opencode stream ended without result"
+    if provider_exit_code == 0 and protocol_error is None and saw_error:
+        protocol_error = "opencode result reported an error"
+    if provider_exit_code == 0 and protocol_error is None:
+        try:
+            report = extract_lane_report(
+                response,
+                task_id=task_id,
+                prompt_sha256=prompt_sha256,
+                begin_count=response.count(REPORT_BEGIN),
+                end_count=response.count(REPORT_END),
+            )
+            report_sha256 = materialize_lane_report(
+                report_path, report, root=report_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            protocol_error = str(exc)
+    exit_code = (
+        PROTOCOL_FAILURE_EXIT
+        if provider_exit_code == 0 and protocol_error is not None
+        else provider_exit_code
+    )
+    failure_class, retryable, fallback_eligible, source, evidence_sha256 = (
+        classify_opencode_failure(
+            bytes(failure_evidence),
+            provider_exit_code=provider_exit_code,
+            protocol_error=protocol_error,
+        )
+    )
+    return StreamResult(
+        provider_exit_code=provider_exit_code,
+        exit_code=exit_code,
+        session_id=conversation_id,
+        stop_reason="TurnCompleted" if exit_code == 0 else None,
+        usage=usage,
+        model_usage=None,
+        num_turns=None,
+        total_cost_usd=total_cost_usd,
+        total_cost_usd_ticks=None,
+        cost_is_partial=None,
+        usage_is_incomplete=None,
+        protocol_error=protocol_error,
+        report_sha256=report_sha256,
+        log_truncated=log_truncated,
+        stderr_bytes=stderr_bytes,
+        failure_class=failure_class,
+        failure_retryable=retryable,
+        fallback_eligible=fallback_eligible,
+        failure_source=source,
+        failure_evidence_sha256=evidence_sha256,
+    )
+
+
+def stream_provider(
+    process: subprocess.Popen[bytes],
+    output: IO[bytes],
+    *,
+    provider: str,
+    expected_session_id: str | None,
+    requested_model: str,
+    task_id: str,
+    prompt_sha256: str,
+    report_path: Path,
+    report_root: Path,
+) -> StreamResult:
+    if provider == "codex":
+        return stream_codex_provider(
+            process,
+            output,
+            expected_session_id=expected_session_id,
+            task_id=task_id,
+            prompt_sha256=prompt_sha256,
+            report_path=report_path,
+            report_root=report_root,
+        )
+    if provider == "agy":
+        return stream_agy_provider(
+            process,
+            output,
+            expected_session_id=expected_session_id,
+            requested_model=requested_model,
+            task_id=task_id,
+            prompt_sha256=prompt_sha256,
+            report_path=report_path,
+            report_root=report_root,
+        )
+    if provider == "qwen":
+        return stream_qwen_provider(
+            process,
+            output,
+            expected_session_id=expected_session_id,
+            requested_model=requested_model,
+            task_id=task_id,
+            prompt_sha256=prompt_sha256,
+            report_path=report_path,
+            report_root=report_root,
+        )
+    if provider == "kimi":
+        return stream_kimi_provider(
+            process,
+            output,
+            expected_session_id=expected_session_id,
+            task_id=task_id,
+            prompt_sha256=prompt_sha256,
+            report_path=report_path,
+            report_root=report_root,
+        )
+    if provider == "cursor":
+        return stream_cursor_provider(
+            process,
+            output,
+            expected_session_id=expected_session_id,
+            task_id=task_id,
+            prompt_sha256=prompt_sha256,
+            report_path=report_path,
+            report_root=report_root,
+        )
+    if provider == "opencode":
+        return stream_opencode_provider(
+            process,
+            output,
+            expected_session_id=expected_session_id,
+            task_id=task_id,
+            prompt_sha256=prompt_sha256,
+            report_path=report_path,
+            report_root=report_root,
+        )
+    if provider != "grok":
+        raise RuntimeError(f"unsupported provider {provider!r}")
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    open_fds = {stdout_fd, stderr_fd}
+    pending = b""
+    log_bytes = 0
+    log_truncated = False
+    protocol_error: str | None = None
+    end_event: dict | None = None
+    saw_error = False
+    stderr_bytes = 0
+    response_tail = ""
+    marker_overlap = ""
+    report_begin_count = 0
+    report_end_count = 0
+    report_sha256: str | None = None
+    failure_evidence = bytearray()
+
+    def write_log(data: bytes) -> None:
+        nonlocal log_bytes, log_truncated
+        remaining = MAX_PROVIDER_LOG_BYTES - log_bytes
+        if remaining <= 0:
+            log_truncated = True
+            return
+        chunk = data[:remaining]
+        output.write(chunk)
+        output.flush()
+        log_bytes += len(chunk)
+        if len(chunk) < len(data):
+            log_truncated = True
+
+    def visible_marker(event_type: str) -> None:
+        marker = f"GROK_EVENT {event_type}\n".encode("utf-8")
+        sys.stdout.buffer.write(marker)
+        sys.stdout.buffer.flush()
+
+    def set_protocol_error(reason: str, line: bytes) -> None:
+        nonlocal protocol_error
+        if protocol_error is not None:
+            return
+        protocol_error = reason
+        digest = hashlib.sha256(line).hexdigest()[:16]
+        write_log(
+            f"\n[grok protocol error: {reason}; bytes={len(line)}; sha256={digest}]\n".encode(
+                "utf-8"
+            )
+        )
+        visible_marker("protocol-error")
+
+    def process_line(line: bytes) -> None:
+        nonlocal end_event, saw_error, response_tail, marker_overlap
+        nonlocal report_begin_count, report_end_count
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            set_protocol_error("malformed streaming-json", line)
+            return
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            set_protocol_error("event must be an object with a string type", line)
+            return
+        event_type = event["type"]
+        if len(event_type) > MAX_EVENT_NAME or not SAFE_NAME.fullmatch(event_type):
+            set_protocol_error("event type is invalid", line)
+            return
+        if end_event is not None:
+            set_protocol_error("event received after end", line)
+            return
+
+        if event_type == "text":
+            data = event.get("data")
+            if not isinstance(data, str):
+                set_protocol_error("text event data must be a string", line)
+                return
+            encoded = data.encode("utf-8", errors="replace")
+            response_tail = (response_tail + data)[-MAX_REPORT_SCAN_CHARS:]
+            marker_scan = marker_overlap + data
+            report_begin_count += marker_scan.count(REPORT_BEGIN)
+            report_end_count += marker_scan.count(REPORT_END)
+            overlap_size = max(len(REPORT_BEGIN), len(REPORT_END)) - 1
+            marker_overlap = marker_scan[-overlap_size:]
+            write_log(encoded)
+            sys.stdout.buffer.write(encoded)
+            sys.stdout.buffer.flush()
+        elif event_type == "thought":
+            if not isinstance(event.get("data"), str):
+                set_protocol_error("thought event data must be a string", line)
+                return
+            write_log(b"\n[grok event: thought]\n")
+            visible_marker("thought")
+        elif event_type == "error":
+            message = event.get("message")
+            if not isinstance(message, str):
+                set_protocol_error("error event message must be a string", line)
+                return
+            saw_error = True
+            bounded_evidence_append(
+                failure_evidence, message.encode("utf-8", errors="replace")
+            )
+            write_log(b"\n[grok event: error]\n")
+            visible_marker("error")
+        elif event_type == "end":
+            session_id = event.get("sessionId")
+            stop_reason = event.get("stopReason")
+            if not isinstance(session_id, str) or session_id != expected_session_id:
+                set_protocol_error("end event sessionId mismatch", line)
+                return
+            if not isinstance(stop_reason, str) or not stop_reason:
+                set_protocol_error("end event stopReason must be a non-empty string", line)
+                return
+            safe_stop_reason = sanitized_stop_reason(stop_reason)
+            end_event = dict(event)
+            end_event["stopReason"] = safe_stop_reason
+            write_log(f"\n[grok end: {safe_stop_reason}]\n".encode("utf-8"))
+            visible_marker("end")
+            if safe_stop_reason not in SUCCESS_STOP_REASONS:
+                set_protocol_error(
+                    f"unsuccessful terminal reason: {safe_stop_reason}", line
+                )
+        else:
+            write_log(f"\n[grok event: {event_type}]\n".encode("utf-8"))
+            visible_marker(event_type)
+
+    def consume(chunk: bytes) -> None:
+        nonlocal pending
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            process_line(line)
+
+    def consume_stderr(chunk: bytes) -> None:
+        nonlocal stderr_bytes
+        stderr_bytes += len(chunk)
+        bounded_evidence_append(failure_evidence, chunk)
+        digest = hashlib.sha256(chunk).hexdigest()[:16]
+        write_log(
+            f"\n[grok stderr: bytes={len(chunk)}; sha256={digest}]\n".encode("utf-8")
+        )
+        visible_marker("stderr")
+
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [], 0.1)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if chunk:
+                if fd == stdout_fd:
+                    consume(chunk)
+                else:
+                    consume_stderr(chunk)
+            else:
+                open_fds.discard(fd)
+    if pending:
+        process_line(pending)
+
+    provider_exit_code = process.wait()
+    if provider_exit_code == 0 and protocol_error is None and saw_error:
+        protocol_error = "provider emitted an error event"
+    if provider_exit_code == 0 and protocol_error is None and end_event is None:
+        protocol_error = "stream ended without an end event"
+    model_usage = sanitized_model_usage((end_event or {}).get("modelUsage"))
+    if (
+        provider_exit_code == 0
+        and protocol_error is None
+        and not grok_model_matches(requested_model, model_usage)
+    ):
+        protocol_error = "effective model does not match requested model"
+    if provider_exit_code == 0 and protocol_error is None:
+        try:
+            report = extract_lane_report(
+                response_tail,
+                task_id=task_id,
+                prompt_sha256=prompt_sha256,
+                begin_count=report_begin_count,
+                end_count=report_end_count,
+            )
+            report_sha256 = materialize_lane_report(
+                report_path, report, root=report_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            protocol_error = str(exc)
+    exit_code = (
+        PROTOCOL_FAILURE_EXIT
+        if provider_exit_code == 0 and protocol_error is not None
+        else provider_exit_code
+    )
+    end = end_event or {}
+    num_turns = end.get("num_turns")
+    if isinstance(num_turns, bool) or not isinstance(num_turns, int) or num_turns < 0:
+        num_turns = None
+    ticks = end.get("total_cost_usd_ticks")
+    if isinstance(ticks, bool) or not isinstance(ticks, int) or ticks < 0:
+        ticks = None
+    classification_error = protocol_error
+    if saw_error and protocol_error == "unsuccessful terminal reason: Error":
+        classification_error = "provider emitted an error event"
+    (
+        failure_class,
+        failure_retryable,
+        fallback_eligible,
+        failure_source,
+        failure_evidence_sha256,
+    ) = classify_grok_failure(
+        bytes(failure_evidence),
+        provider_exit_code=provider_exit_code,
+        protocol_error=classification_error,
+    )
+    return StreamResult(
+        provider_exit_code=provider_exit_code,
+        exit_code=exit_code,
+        session_id=end.get("sessionId") if isinstance(end.get("sessionId"), str) else None,
+        stop_reason=end.get("stopReason") if isinstance(end.get("stopReason"), str) else None,
+        usage=sanitized_usage(end.get("usage"), TOKEN_FIELDS),
+        model_usage=model_usage,
+        num_turns=num_turns,
+        total_cost_usd=safe_scalar(end.get("total_cost_usd")),
+        total_cost_usd_ticks=ticks,
+        cost_is_partial=end.get("cost_is_partial")
+        if isinstance(end.get("cost_is_partial"), bool)
+        else None,
+        usage_is_incomplete=end.get("usage_is_incomplete")
+        if isinstance(end.get("usage_is_incomplete"), bool)
+        else None,
+        protocol_error=protocol_error,
+        report_sha256=report_sha256,
+        log_truncated=log_truncated,
+        stderr_bytes=stderr_bytes,
+        failure_class=failure_class,
+        failure_retryable=failure_retryable,
+        fallback_eligible=fallback_eligible,
+        failure_source=failure_source,
+        failure_evidence_sha256=failure_evidence_sha256,
+    )
+
+
+def write_runtime_receipt(
+    *,
+    path: Path,
+    args: argparse.Namespace,
+    lease: Lease,
+    prompt_sha256: str | None,
+    provider_version_text: str | None,
+    started_at: str,
+    result: StreamResult,
+    failure_class: str | None = None,
+) -> None:
+    effective_failure_class = failure_class or result.failure_class
+    provider_sandbox = {
+        "codex": CODEX_SANDBOX_PROFILE,
+        "agy": AGY_SANDBOX_PROFILE,
+        "grok": GROK_SANDBOX_PROFILE,
+        "qwen": QWEN_SANDBOX_PROFILE,
+        "kimi": KIMI_SANDBOX_PROFILE,
+        "cursor": CURSOR_SANDBOX_PROFILE,
+        "opencode": OPENCODE_SANDBOX_PROFILE,
+    }.get(args.provider, GROK_SANDBOX_PROFILE)
+    permission_mode = {
+        "codex": "never",
+        "agy": "always-proceed",
+        "grok": "bypassPermissions",
+        "qwen": "yolo",
+        "kimi": "headless-auto",
+        "cursor": "force",
+        "opencode": "skip-permissions",
+    }.get(args.provider, "bypassPermissions")
+    receipt: dict[str, object] = {
+        "schema_version": 1,
+        "provider": args.provider,
+        "provider_version": provider_version_text,
+        "model": args.model,
+        "reasoning_effort": args.reasoning_effort,
+        "sandbox": RUNTIME_SANDBOX_PROFILE,
+        "provider_sandbox": provider_sandbox,
+        "subagents_enabled": False,
+        "permission_mode": permission_mode,
+        "control_plane_read_only": True,
+        "task_id": args.task_id,
+        "role": args.role,
+        "slot": lease.slot,
+        "mode": "new" if lease.is_new else "resume",
+        "session_id": result.session_id or lease.record.get("session_id"),
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "provider_exit_code": result.provider_exit_code,
+        "exit_code": result.exit_code,
+        "protocol_valid": (
+            result.exit_code == 0
+            and result.protocol_error is None
+            and effective_failure_class is None
+        ),
+        "log_truncated": result.log_truncated,
+        "stderr_bytes": result.stderr_bytes,
+    }
+    attempt = runtime_attempt(args.output)
+    if attempt is not None:
+        receipt["attempt"] = attempt
+    optional = {
+        "stop_reason": result.stop_reason,
+        "usage": result.usage,
+        "model_usage": result.model_usage,
+        "num_turns": result.num_turns,
+        "total_cost_usd": result.total_cost_usd,
+        "total_cost_usd_ticks": result.total_cost_usd_ticks,
+        "cost_is_partial": result.cost_is_partial,
+        "usage_is_incomplete": result.usage_is_incomplete,
+        "protocol_error": result.protocol_error,
+        "report_sha256": result.report_sha256,
+        "prompt_sha256": prompt_sha256,
+        "failure_class": effective_failure_class,
+        "failure_retryable": result.failure_retryable
+        if effective_failure_class is not None
+        else None,
+        "fallback_eligible": result.fallback_eligible
+        if effective_failure_class is not None
+        else None,
+        "failure_source": result.failure_source,
+        "failure_evidence_sha256": result.failure_evidence_sha256,
+    }
+    receipt.update({key: value for key, value in optional.items() if value is not None})
+    save_state(path, receipt)
+    try:
+        from usage_ledger import record_receipt
+        record_receipt(receipt)
+    except Exception:
+        # ponytail: receipt write stays the source of truth; usage db is best-effort
+        pass
+
+
+def finish_lease(
+    *,
+    run_dir: Path,
+    lease: Lease,
+    task_id: str,
+    exit_code: int,
+    captured_session_id: str | None,
+) -> dict:
+    state_path = run_dir / "sessions.json"
+    state_lock = lock_file(runtime_lock_dir(run_dir) / "state.lock")
+    assert state_lock is not None
+    state = load_state(state_path)
+    record = dict(state["sessions"].get(lease.key, lease.record))
+    record.pop("current_task", None)
+    record["updated_at"] = utc_now()
+
+    if exit_code == 0 and captured_session_id:
+        record["session_id"] = captured_session_id
+    if exit_code == 0 and record.get("session_id"):
+        record["success_count"] = int(
+            record.get("success_count", len(record.get("tasks", [])))
+        ) + 1
+        if task_id not in record["tasks"]:
+            record["tasks"].append(task_id)
+        record["status"] = "idle"
+        record["invalid"] = False
+        record.pop("invalid_reason", None)
+    elif exit_code == 0:
+        record["status"] = "capture_failed"
+        record["invalid"] = True
+        record["invalid_reason"] = "conversation_capture_failed"
+    else:
+        record["status"] = "failed"
+        record["invalid"] = True
+        record["invalid_reason"] = f"provider_exit_{exit_code}"
+
+    state["sessions"][lease.key] = record
+    save_state(state_path, state)
+    unlock_file(state_lock)
+    return record
+
+
+def run_provider(args: argparse.Namespace) -> int:
+    run_dir = args.run_dir.resolve()
+    cwd = args.cwd.resolve()
+    if not cwd.is_dir():
+        raise RuntimeError(f"cwd is not a directory: {cwd}")
+    if not args.prompt_file.is_file():
+        raise RuntimeError(f"prompt file not found: {args.prompt_file}")
+
+    lease = acquire_lease(
+        run_dir=run_dir,
+        provider=args.provider,
+        role=args.role,
+        cwd=str(cwd),
+        model=args.model,
+        task_id=args.task_id,
+        pool_size=args.pool_size,
+        max_tasks=args.max_tasks,
+    )
+    completed = False
+    captured: str | None = lease.record.get("session_id")
+    process: subprocess.Popen[bytes] | None = None
+    result: StreamResult | None = None
+    version_text: str | None = None
+    prompt_sha256: str | None = None
+    provider_state_dir: Path | None = None
+    started_at = utc_now()
+    old_handlers: dict[int, signal.Handlers] = {}
+
+    def handle_signal(signum: int, _frame: object) -> None:
+        raise LaneInterrupted(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        old_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, handle_signal)
+    try:
+        prompt_sha256 = hashlib.sha256(args.prompt_file.read_bytes()).hexdigest()
+        provider_argv = provider_command(args, lease, prompt_sha256=prompt_sha256)
+        stdin_payload = provider_input(args, prompt_sha256=prompt_sha256)
+        provider_state_dir = prepare_codex_home(
+            args.provider,
+            run_dir=run_dir,
+            key=lease.key,
+            reset=lease.is_new,
+        )
+        provider_env = provider_environment(
+            args.provider, reasoning_effort=args.reasoning_effort
+        )
+        if provider_state_dir is not None:
+            provider_env["CODEX_HOME"] = str(provider_state_dir)
+        provider_home = Path(provider_env.get("HOME", str(Path.home()))).resolve()
+        command = sandbox_provider_command(
+            provider_argv,
+            provider=args.provider,
+            run_dir=run_dir,
+            cwd=cwd,
+            home=provider_home,
+            provider_state_dir=provider_state_dir,
+        )
+        version_text = provider_version(
+            sandbox_provider_command(
+                [provider_argv[0], "--version"],
+                provider=args.provider,
+                run_dir=run_dir,
+                cwd=cwd,
+                home=provider_home,
+                provider_state_dir=provider_state_dir,
+            ),
+            cwd=cwd,
+            environment=provider_env,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+
+        print(
+            f"LANE_SESSION start provider={args.provider} role={args.role} "
+            f"slot={lease.slot} mode={'new' if lease.is_new else 'resume'} "
+            f"task={args.task_id}",
+            flush=True,
+        )
+        with args.output.open("wb") as output:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=provider_env,
+                stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            if stdin_payload is not None:
+                assert process.stdin is not None
+                process.stdin.write(stdin_payload)
+                process.stdin.close()
+            result = stream_provider(
+                process,
+                output,
+                provider=args.provider,
+                expected_session_id=lease.record.get("session_id"),
+                requested_model=args.model,
+                task_id=args.task_id,
+                prompt_sha256=prompt_sha256,
+                report_path=run_dir / "artifacts" / args.task_id / "report.md",
+                report_root=run_dir,
+            )
+            if result.session_id:
+                captured = result.session_id
+            exit_code = result.exit_code
+
+        record = finish_lease(
+            run_dir=run_dir,
+            lease=lease,
+            task_id=args.task_id,
+            exit_code=exit_code,
+            captured_session_id=captured,
+        )
+        write_runtime_receipt(
+            path=args.output.with_name("runtime.json"),
+            args=args,
+            lease=lease,
+            prompt_sha256=prompt_sha256,
+            provider_version_text=version_text,
+            started_at=started_at,
+            result=result,
+        )
+        completed = True
+        print(
+            f"LANE_SESSION done provider={args.provider} slot={lease.slot} "
+            f"task={args.task_id} exit={exit_code} status={record['status']} "
+            f"turns={record['success_count']}",
+            flush=True,
+        )
+        return exit_code
+    except LaneInterrupted as exc:
+        terminate_provider(process)
+        exit_code = 128 + exc.signum
+        finish_lease(
+            run_dir=run_dir,
+            lease=lease,
+            task_id=args.task_id,
+            exit_code=exit_code,
+            captured_session_id=captured,
+        )
+        result = StreamResult(
+            provider_exit_code=exit_code,
+            exit_code=exit_code,
+            session_id=captured,
+            stop_reason=None,
+            usage=None,
+            model_usage=None,
+            num_turns=None,
+            total_cost_usd=None,
+            total_cost_usd_ticks=None,
+            cost_is_partial=None,
+            usage_is_incomplete=None,
+            protocol_error="interrupted",
+            report_sha256=None,
+            log_truncated=False,
+            stderr_bytes=0,
+            failure_class=None,
+            failure_retryable=False,
+            fallback_eligible=False,
+            failure_source="signal",
+            failure_evidence_sha256=None,
+        )
+        write_runtime_receipt(
+            path=args.output.with_name("runtime.json"),
+            args=args,
+            lease=lease,
+            prompt_sha256=prompt_sha256,
+            provider_version_text=version_text,
+            started_at=started_at,
+            result=result,
+        )
+        completed = True
+        print(
+            f"LANE_SESSION interrupted provider={args.provider} slot={lease.slot} "
+            f"task={args.task_id} signal={exc.signum}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return exit_code
+    except BaseException as exc:
+        try:
+            terminate_provider(process)
+        except Exception as cleanup_exc:
+            print(
+                "lane-session: provider cleanup failed "
+                f"({type(cleanup_exc).__name__})",
+                file=sys.stderr,
+            )
+        if not completed:
+            try:
+                finish_lease(
+                    run_dir=run_dir,
+                    lease=lease,
+                    task_id=args.task_id,
+                    exit_code=125,
+                    captured_session_id=captured,
+                )
+            except Exception as state_exc:
+                print(
+                    "lane-session: failed to invalidate session "
+                    f"({type(state_exc).__name__})",
+                    file=sys.stderr,
+                )
+            failure = StreamResult(
+                provider_exit_code=125,
+                exit_code=125,
+                session_id=captured,
+                stop_reason=None,
+                usage=None,
+                model_usage=None,
+                num_turns=None,
+                total_cost_usd=None,
+                total_cost_usd_ticks=None,
+                cost_is_partial=None,
+                usage_is_incomplete=None,
+                protocol_error=None,
+                report_sha256=None,
+                log_truncated=False,
+                stderr_bytes=0,
+                failure_class=None,
+                failure_retryable=False,
+                fallback_eligible=False,
+                failure_source="exception",
+                failure_evidence_sha256=None,
+            )
+            try:
+                write_runtime_receipt(
+                    path=args.output.with_name("runtime.json"),
+                    args=args,
+                    lease=lease,
+                    prompt_sha256=prompt_sha256,
+                    provider_version_text=version_text,
+                    started_at=started_at,
+                    result=failure,
+                    failure_class=type(exc).__name__,
+                )
+            except Exception as receipt_exc:
+                print(
+                    "lane-session: failed to write runtime receipt "
+                    f"({type(receipt_exc).__name__})",
+                    file=sys.stderr,
+                )
+        raise
+    finally:
+        for signum, old_handler in old_handlers.items():
+            signal.signal(signum, old_handler)
+        unlock_file(lease.handle)
+
+
+def positive_bounded(value: str, *, maximum: int, name: str) -> int:
+    parsed = int(value)
+    if parsed < 1 or parsed > maximum:
+        raise argparse.ArgumentTypeError(f"{name} must be between 1 and {maximum}")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run a typed writer provider in a bounded session pool"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="acquire a session slot and run one task")
+    run.add_argument(
+        "--provider",
+        required=True,
+        choices=("agy", "grok", "codex", "qwen", "kimi", "cursor", "opencode"),
+    )
+    run.add_argument("--run-dir", required=True, type=Path)
+    run.add_argument("--task-id", required=True)
+    run.add_argument("--role", required=True)
+    run.add_argument("--cwd", required=True, type=Path)
+    run.add_argument("--prompt-file", required=True, type=Path)
+    run.add_argument("--output", required=True, type=Path)
+    run.add_argument("--binary", help="provider binary override (primarily for tests)")
+    run.add_argument("--model", required=True)
+    run.add_argument("--reasoning-effort", default="high")
+    run.add_argument(
+        "--service-tier",
+        choices=("standard", "fast"),
+        default="standard",
+        help="codex/cursor: speed tier (codex ChatGPT credits; cursor -fast model sibling)",
+    )
+    run.add_argument(
+        "--fast-mode",
+        action="store_true",
+        help="codex/cursor: alias for --service-tier fast",
+    )
+    run.add_argument("--print-timeout", default="90m")
+    run.add_argument(
+        "--pool-size",
+        type=lambda value: positive_bounded(
+            value, maximum=HARD_MAX_POOL, name="pool-size"
+        ),
+        default=positive_bounded(
+            os.environ.get("LANE_SESSION_POOL_SIZE", str(DEFAULT_POOL_SIZE)),
+            maximum=HARD_MAX_POOL,
+            name="pool-size",
+        ),
+    )
+    run.add_argument(
+        "--max-tasks",
+        type=lambda value: positive_bounded(
+            value, maximum=HARD_MAX_TASKS, name="max-tasks"
+        ),
+        default=positive_bounded(
+            os.environ.get("LANE_SESSION_MAX_TASKS", str(DEFAULT_MAX_TASKS)),
+            maximum=HARD_MAX_TASKS,
+            name="max-tasks",
+        ),
+    )
+
+    status = sub.add_parser("status", help="print run session state")
+    status.add_argument("--run-dir", required=True, type=Path)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command == "status":
+        state_path = args.run_dir.resolve() / "sessions.json"
+        print(json.dumps(load_state(state_path), indent=2, sort_keys=True))
+        return 0
+
+    if not SAFE_NAME.fullmatch(args.role):
+        parser.error("--role may contain only letters, numbers, dot, underscore, hyphen")
+    if not SAFE_NAME.fullmatch(args.task_id):
+        parser.error("--task-id may contain only letters, numbers, dot, underscore, hyphen")
+    try:
+        return run_provider(args)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"lane-session: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
